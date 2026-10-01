@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# guy-computer: GUY's eyes and hands on the desktop, for GUY's assistant to call from its shell.
+#
+#   guy-computer screenshot            the screen as a PNG (in screen coordinates); read it to see
+#   guy-computer windows               open windows: class, title, position and size
+#   guy-computer focus NAME            switch to a window by class or title
+#   guy-computer click X Y [--right|--middle] [--double]
+#   guy-computer move X Y
+#   guy-computer scroll X Y up|down [N]
+#   guy-computer type "text"           type into the focused window
+#   guy-computer key ctrl+k            press keys: Return, Escape, Tab, ctrl+shift+t, super+1, …
+#   guy-computer send-key Return       the key that sends a message or post to someone: asks the user first
+#
+# Coordinates are Hyprland's layout coordinates, the same as the screenshot's pixels. Before acting,
+# GUY steps aside (hides its panel and lets go of the keyboard) so input reaches the app.
+# Needs wtype (typing, keys) and wlrctl (clicks, scrolling): yay -S wtype wlrctl
+
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "guy.sock")
+SHOTS = os.path.expanduser("~/.cache/guy/screens")
+MODS = {"ctrl": "ctrl", "control": "ctrl", "shift": "shift", "alt": "alt", "super": "logo", "win": "logo",
+        "meta": "logo", "logo": "logo", "altgr": "altgr"}
+KEYS = {"enter": "Return", "return": "Return", "esc": "Escape", "escape": "Escape", "tab": "Tab",
+        "backspace": "BackSpace", "delete": "Delete", "del": "Delete", "space": "space", "up": "Up",
+        "down": "Down", "left": "Left", "right": "Right", "home": "Home", "end": "End",
+        "pageup": "Page_Up", "pagedown": "Page_Down", "insert": "Insert"}
+
+
+def die(msg):
+    print(f"guy-computer: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def need(tool):
+    if not shutil.which(tool):
+        die(f"{tool} isn't installed; ask the user to run: yay -S wtype wlrctl")
+
+
+def run(*cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"{cmd[0]} failed: {(r.stderr or r.stdout).strip()[:200]}")
+    return r.stdout
+
+
+def hypr(dispatch):
+    out = run("hyprctl", "dispatch", dispatch).strip()
+    if out and out != "ok":
+        die(f"hyprctl: {out}")
+
+
+def step_aside():
+    """Hide GUY's panel and release the keyboard, so screenshots show the app and input reaches it."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            s.connect(SOCK)
+            s.sendall(b'{"guy_command": "aside"}\n')
+        time.sleep(0.35)                     # let the panel slide away
+    except OSError:
+        pass
+
+
+def clients():
+    return [c for c in json.loads(run("hyprctl", "clients", "-j")) if c.get("mapped", True)]
+
+
+def move(x, y):
+    hypr(f"hl.dsp.cursor.move({{ x = {int(x)}, y = {int(y)} }})")
+
+
+def keys(combo):
+    """"ctrl+shift+t" -> wtype -M ctrl -M shift -k t -m shift -m ctrl"""
+    parts = [p for p in re.split(r"\s*\+\s*", combo.strip()) if p]
+    if not parts:
+        die("no key given")
+    *mods, key = parts
+    args = []
+    for m in mods:
+        if m.lower() not in MODS:
+            die(f"unknown modifier {m!r}")
+        args += ["-M", MODS[m.lower()]]
+    args += ["-k", KEYS.get(key.lower(), key)]
+    for m in reversed(mods):
+        args += ["-m", MODS[m.lower()]]
+    return args
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(open(__file__).read().split("\n\n")[0].replace("#!/usr/bin/env python3\n", ""))
+        return
+    cmd, args = sys.argv[1], sys.argv[2:]
+
+    if cmd == "screenshot":
+        step_aside()
+        os.makedirs(SHOTS, exist_ok=True)
+        for old in sorted(os.listdir(SHOTS))[:-10]:          # keep the last few
+            os.remove(os.path.join(SHOTS, old))
+        path = os.path.join(SHOTS, time.strftime("screen-%H%M%S.png"))
+        run("grim", "-s", "1", path)                          # scale 1: pixels are layout coordinates
+        pos = run("hyprctl", "cursorpos").strip()
+        active = json.loads(run("hyprctl", "activewindow", "-j") or "{}")
+        print(f"{path}\ncursor at {pos}; focused: {active.get('class', '?')} \"{active.get('title', '')}\"")
+    elif cmd == "windows":
+        for c in clients():
+            (x, y), (w, h) = c["at"], c["size"]
+            ws = c.get("workspace", {}).get("name", "?")
+            print(f"{c['class']:20} {w}x{h}+{x}+{y}  workspace {ws}  \"{c.get('title', '')[:70]}\"")
+    elif cmd == "focus":
+        name = " ".join(args).lower()
+        match = next((c for c in clients() if name in c["class"].lower()), None) or \
+            next((c for c in clients() if name in c.get("title", "").lower()), None)
+        if not match:
+            die(f"no window matches {name!r}")
+        step_aside()
+        hypr(f'hl.dsp.focus({{ window = "address:{match["address"]}" }})')
+        print(f"focused {match['class']} \"{match.get('title', '')}\"")
+    elif cmd in ("move", "click", "scroll"):
+        if len(args) < 2:
+            die(f"usage: guy-computer {cmd} X Y ...")
+        x, y = float(args[0]), float(args[1])
+        step_aside()
+        move(x, y)
+        time.sleep(0.05)
+        if cmd == "click":
+            need("wlrctl")
+            button = "right" if "--right" in args else "middle" if "--middle" in args else "left"
+            for _ in range(2 if "--double" in args else 1):
+                run("wlrctl", "pointer", "click", button)
+                time.sleep(0.08)
+            print(f"{'double-' if '--double' in args else ''}{button}-clicked at {int(x)},{int(y)}")
+        elif cmd == "scroll":
+            need("wlrctl")
+            direction = args[2] if len(args) > 2 else "down"
+            n = int(args[3]) if len(args) > 3 else 3
+            run("wlrctl", "pointer", "scroll", str((15 if direction == "down" else -15) * n))
+            print(f"scrolled {direction} {n} at {int(x)},{int(y)}")
+        else:
+            print(f"moved to {int(x)},{int(y)}")
+    elif cmd == "type":
+        need("wtype")
+        step_aside()
+        text = " ".join(args)
+        run("wtype", "-d", "8", "--", text)
+        print(f"typed {len(text)} characters")
+    elif cmd in ("key", "send-key"):
+        need("wtype")
+        step_aside()
+        for combo in args:
+            run("wtype", *keys(combo))
+            time.sleep(0.05)
+        print("pressed " + " ".join(args))
+    else:
+        die(f"unknown command {cmd!r} (try --help)")
+
+
+if __name__ == "__main__":
+    main()

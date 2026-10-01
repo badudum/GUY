@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+# guy-hook: the relay Claude Code runs on every hook event. It reads the hook JSON on stdin and
+# hands it to GUY over $XDG_RUNTIME_DIR/guy.sock.
+#
+# It never blocks Claude Code:
+#  * GUY not running (no socket, or nobody answers within 300 ms): exit 0 with nothing printed.
+#  * Only PermissionRequest waits for an answer, because Allow / Deny on the island is the point.
+#    No answer (timeout, "Ask in terminal", GUY closed) prints nothing, and Claude Code asks in the
+#    terminal exactly as if GUY weren't installed.
+#
+# Usage: guy-hook <EventName>   (the name is also read from the JSON)
+#
+# `guy-hook agent` is GUY's own safety layer, the PreToolUse hook on every action GUY's assistant
+# takes (Ask GUY, voice, scheduled tasks). Ordinary actions are allowed on the spot; risky ones
+# (deleting, sudo, installing, system changes, sending data out, touching keys and config) wait for
+# your yes on the island. No answer, or GUY not running, means no.
+
+import json
+import os
+import re
+import socket
+import sys
+
+SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "guy.sock")
+CONNECT_TIMEOUT = 0.3
+SEND_TIMEOUT = 2.0
+DECISION_BUDGET = 110.0
+DROPPED_FIELDS = ("tool_response", "transcript_path")   # pointless to forward, can be enormous
+MAX_FIELD_LEN = 2000
+MAX_REPLY_LEN = 20000                                    # Claude's final reply, shown in full on the island
+
+
+def trim(value):
+    if isinstance(value, str):
+        return value if len(value) <= MAX_FIELD_LEN else value[:MAX_FIELD_LEN] + "…"
+    if isinstance(value, list):
+        return [trim(v) for v in value]
+    if isinstance(value, dict):
+        return {k: trim(v) for k, v in value.items()}
+    return value
+
+
+def last_reply(transcript):
+    """The text of the last assistant message in a Claude Code transcript (JSONL)."""
+    try:
+        with open(transcript, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 400_000))
+            tail = f.read()
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        content = entry.get("message", {}).get("content", [])
+        if isinstance(content, str):
+            text = content
+        else:
+            text = "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+        if text.strip():
+            return text.strip()
+    return ""
+
+
+# ---------- GUY's assistant: what needs your OK ----------
+HOME = os.path.expanduser("~")
+SAFE_TOOLS = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "LS"}
+SENSITIVE = (".ssh", ".gnupg", ".password-store", ".pki", ".claude", ".config/hypr", ".config/systemd",
+             ".local/bin", ".local/share/keyrings", ".mozilla", ".config/google-chrome", ".bashrc", ".zshrc",
+             ".profile", ".bash_profile", ".config/fish", ".xinitrc", ".config/autostart")
+# reading these sends them to the AI: keys, passwords, browser logins
+SECRETS = (".ssh", ".gnupg", ".password-store", ".local/share/keyrings", ".pki", ".netrc", ".git-credentials",
+           ".config/google-chrome", ".mozilla", ".aws", ".docker/config.json", ".kube")
+SECRET_RE = r"(~|\$HOME|" + re.escape(HOME) + r")/(" + "|".join(re.escape(x) for x in SECRETS) + r")\b"
+RISKY_COMMANDS = [
+    (SECRET_RE, "read your keys or passwords"),
+    (r"\bguy-computer\s+send-key\b", "send a message from your computer"),
+    (r"\b(rm|rmdir|shred|unlink|srm|trash-empty)\b|\bfind\b.*\s-delete\b|\bgit\s+(clean|reset\s+--hard|checkout\s+--|restore)\b",
+     "delete files"),
+    (r"\b(sudo|doas|pkexec|run0|su)\b", "run something as root"),
+    (r"\b(pacman|yay|paru|pamac|flatpak\s+(install|uninstall|remove)|snap|pip3?\s+(install|uninstall)|pipx\s+(install|uninstall)"
+     r"|npm\s+(i|install|uninstall|remove)\s+(-g|--global)|cargo\s+(install|uninstall)|makepkg)\b", "install or remove software"),
+    (r"\b(kill|pkill|killall|xkill)\b", "close running programs"),
+    (r"\b(systemctl|mkfs\S*|dd|fdisk|parted|mount|umount|chown|crontab|shutdown|reboot|poweroff|halt|loginctl|"
+     r"hyprctl\s+(dispatch\s+exit|keyword)|modprobe|rmmod|ufw|iptables|nft)\b|\bchmod\s+-R\b",
+     "change system settings"),
+    (r"\bcurl\b.*\s(-d|--data\S*|-F|--form|-T|--upload-file|-X\s*(POST|PUT|PATCH|DELETE))\b|\bwget\b.*--post"
+     r"|\b(scp|rsync|sftp|ftp|ssh|nc|ncat|socat|mail|mailx|sendmail|mutt|msmtp)\b|\bgit\s+push\b"
+     r"|\bgh\s+(pr|issue|release|repo|gist|api)\b", "send something off this laptop"),
+]
+
+
+def short(path):
+    return path.replace(HOME, "~", 1)
+
+
+def risk(tool, inp):
+    """What's risky about this action, in words ("delete files"), or None when it can just happen."""
+    inp = inp if isinstance(inp, dict) else {}
+    if tool == "Read":
+        path = os.path.realpath(os.path.expanduser(str(inp.get("file_path", ""))))
+        rel = path[len(HOME) + 1:] if path.startswith(HOME + "/") else ""
+        if any(rel == d or rel.startswith(d + "/") for d in SECRETS):
+            return f"read {short(path)}"
+        return None
+    if tool in SAFE_TOOLS:
+        return None
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        path = os.path.realpath(os.path.expanduser(str(inp.get("file_path") or inp.get("notebook_path") or "")))
+        if not path.startswith(HOME + "/"):
+            return f"change {path} (outside your home folder)"
+        rel = path[len(HOME) + 1:]
+        if any(rel == d or rel.startswith(d + "/") for d in SENSITIVE):
+            return f"change {short(path)}"
+        return None
+    if tool == "Bash":
+        cmd = str(inp.get("command", ""))
+        for pattern, what in RISKY_COMMANDS:
+            if re.search(pattern, cmd):
+                return what
+        if re.search(r"(^|[\s;&|])>\s*(/(?!tmp/|dev/null)|~/\.)", cmd):   # overwriting a file outside home / a dotfile
+            return "overwrite a file"
+        return None
+    return f"use {tool}"
+
+
+def agent_hook(ev):
+    tool, inp = ev.get("tool_name", ""), ev.get("tool_input") or {}
+
+    def answer(decision, reason=""):
+        out = {"hookEventName": "PreToolUse", "permissionDecision": decision}
+        if reason:
+            out["permissionDecisionReason"] = reason
+        print(json.dumps({"hookSpecificOutput": out}), flush=True)
+
+    what = risk(tool, inp)
+    if what is None:
+        answer("allow")
+        return
+    ask = {"hook_event_name": "PermissionRequest", "guy_agent": True, "risk": what, "tool_name": tool,
+           "tool_input": trim(inp), "cwd": ev.get("cwd") or os.getcwd(), "session_id": "guy-agent"}
+    buf = b""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(CONNECT_TIMEOUT)
+            s.connect(SOCK)
+            s.settimeout(SEND_TIMEOUT)
+            s.sendall((json.dumps(ask) + "\n").encode())
+            s.settimeout(DECISION_BUDGET)
+            while b"\n" not in buf:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError:
+        answer("deny", f"This would {what}, which needs the user's OK, and GUY couldn't ask them. Don't try another way.")
+        return
+    if buf.decode(errors="replace").strip() == "allow":
+        answer("allow")
+    else:
+        answer("deny", f"The user said no to this ({what}). Don't try to do it another way; tell them it wasn't done.")
+
+
+def decision_json(decision):
+    """The documented PermissionRequest output; anything unrecognised prints nothing."""
+    behavior = {"allow": {"behavior": "allow"},
+                "deny": {"behavior": "deny", "message": "Denied from GUY"}}.get(decision.strip())
+    if behavior is None:
+        return None
+    return json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": behavior}})
+
+
+def main():
+    raw = sys.stdin.buffer.read()
+    try:
+        ev = json.loads(raw.decode("utf-8-sig"))
+    except ValueError:
+        return
+    if not isinstance(ev, dict):
+        return
+    if sys.argv[1:2] == ["agent"]:
+        agent_hook(ev)
+        return
+    if not os.path.exists(SOCK):
+        return
+    event = ev.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "")
+    ev["hook_event_name"] = event
+    reply = ""
+    if event == "Stop":
+        reply = str(ev.get("last_assistant_message") or "") or last_reply(ev.get("transcript_path") or "")
+    for field in DROPPED_FIELDS:
+        ev.pop(field, None)
+    if not ev.get("cwd"):
+        ev["cwd"] = os.getcwd()
+    waits = event == "PermissionRequest"
+
+    buf = b""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(CONNECT_TIMEOUT)
+            s.connect(SOCK)
+            s.settimeout(SEND_TIMEOUT)
+            ev = trim(ev)
+            if reply:
+                ev["last_reply"] = reply[:MAX_REPLY_LEN]
+            s.sendall((json.dumps(ev) + "\n").encode())
+            if not waits:
+                return
+            s.settimeout(DECISION_BUDGET)
+            while b"\n" not in buf:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError:
+        return
+    out = decision_json(buf.decode(errors="replace"))
+    if out:
+        print(out, flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # noqa: BLE001 - whatever happens, Claude Code carries on
+        pass
+    sys.exit(0)

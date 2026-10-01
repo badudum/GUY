@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+# the speech libraries live in GUY's own venv (~/.local/share/guy/venv), not the system Python
+VENV_PY = os.path.expanduser("~/.local/share/guy/venv/bin/python")
+if os.path.exists(VENV_PY) and sys.prefix != os.path.dirname(os.path.dirname(VENV_PY)):
+    os.execv(VENV_PY, [VENV_PY] + sys.argv)
+
+# guy-voice: GUY's ears and voice, all on this laptop; no audio ever leaves it.
+#
+#  * "Hey GUY": Vosk listens for the wake phrase only (a tiny grammar, a few % of one core).
+#  * Super+Space (`guy --listen`) skips the wake phrase.
+#  * After either, it records until you stop talking, Whisper (base.en) writes down what you said,
+#    and GUY does it: plain commands straight away, anything else goes to Claude.
+#  * GUY's answers are spoken with Piper (en_US lessac).
+#
+# Wake-word listening can be switched off (`guy --voice off`, or the mic button in the overview);
+# the microphone is then closed entirely until you press the hotkey. The choice is remembered.
+#
+#   guy-voice    run in the background (started from ~/.config/hypr/hyprland.lua)
+
+import itertools
+import json
+import re
+import signal
+import socket
+import subprocess
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+GUY_SOCK = RUNTIME / "guy.sock"
+VOICE_SOCK = RUNTIME / "guy-voice.sock"
+MODELS = Path.home() / ".local/share/guy/models"
+STATE = Path.home() / ".local/state/guy/voice.json"
+
+RATE = 16000
+CHUNK = 1600                      # 0.1 s of 16-bit mono
+PREROLL = 15                      # chunks kept before the wake phrase, so "hey guy lower the sound" in one breath works
+END_PAUSE = 15                    # 1.5 s without new words: you've finished
+LONG_PAUSE = 25                   # 2.5 s when the sentence is left hanging ("turn up the…")
+NO_SPEECH = 80                    # after "Hey GUY", wait up to 8 s for you to start
+FOLLOWUP_WAIT = 60                # after GUY answers, 6 s for a follow-up before going back to sleep
+# a sentence that ends on one of these isn't finished yet
+DANGLING = re.compile(r"\b(the|a|an|to|and|or|of|for|up|down|can|could|would|you|please|my|is|are|what|whats|how|"
+                      r"in|on|at|with|me|set|turn|open|play|put|make|about|like|then|but|so|if|it's|its)$")
+MAX_UTTERANCE = 150               # 15 s at most
+COOLDOWN = 1.5
+STREAM_PROPS = '{ media.name = "GUY", application.name = "GUY" }'   # how the mic and voice show up in PipeWire
+# a few ordinary words around the wake phrase, so everyday speech doesn't get forced onto "hey guy"
+WAKE_GRAMMAR = ["hey guy", "hey", "guy", "guys", "hey guys", "hi", "okay", "by", "buy", "high", "the", "a", "i",
+                "you", "it", "is", "and", "to", "what", "go", "day", "gay", "hay", "[unk]"]
+
+
+# the wake phrase as it tends to come out of the recognisers ("a guy", "hey kai", "okay guys")
+WAKE_WORDS = re.compile(r"^\W*(?:\w+\W+)?(?:guys?|guy's|kai|kay|gay|guide?)\b\W*", re.I)   # any one word, then "guy"
+
+
+def log(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, file=sys.stderr, flush=True)
+
+
+def notify(**event):
+    """Tell GUY what's happening; if GUY isn't running there's nobody to tell."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            s.connect(str(GUY_SOCK))
+            s.sendall((json.dumps({"guy_command": "voice", **event}) + "\n").encode())
+    except OSError:
+        pass
+
+
+def app_hint():
+    """A prompt that primes Whisper with the names of installed apps, so "Discord" doesn't come out as
+    "this cord". Read from the .desktop files, the same ones the app launcher uses."""
+    names = set()
+    dirs = [Path("/usr/share/applications"), Path.home() / ".local/share/applications",
+            Path("/var/lib/flatpak/exports/share/applications")]
+    for d in dirs:
+        for f in d.glob("*.desktop") if d.is_dir() else ():
+            try:
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            if re.search(r"^NoDisplay=true", text, re.M):
+                continue
+            if m := re.search(r"^Name=(.+)$", text, re.M):
+                if len(m[1]) <= 24:
+                    names.add(m[1].strip())
+    return "Hey GUY. Open " + ", ".join(sorted(names)[:80]) + "."
+
+
+def blip(up=True):
+    """A soft two-note blip: rising when GUY starts listening, falling when he stops."""
+    sr = 22050
+    notes = (660, 990) if up else (880, 587)
+    parts = []
+    for f in notes:
+        t = np.arange(int(sr * 0.07)) / sr
+        env = np.minimum(1, t / 0.008) * np.exp(-t * 28)
+        parts.append(np.sin(2 * np.pi * f * t) * env * 0.18)
+    wave = (np.concatenate(parts) * 32767).astype(np.int16).tobytes()
+    try:
+        p = subprocess.Popen(["pw-play", "--raw", "--rate", str(sr), "--channels", "1", "--format", "s16", "-"],
+                             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p.communicate(wave, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+class Voice:
+    def __init__(self):
+        from faster_whisper import WhisperModel
+        from piper import PiperVoice
+        from vosk import KaldiRecognizer, Model, SetLogLevel
+
+        SetLogLevel(-1)
+        self.vosk = Model(str(MODELS / "vosk-model-small-en-us-0.15"))
+        self.KaldiRecognizer = KaldiRecognizer
+        self.wake_rec = KaldiRecognizer(self.vosk, RATE, json.dumps(WAKE_GRAMMAR))
+        self.words_rec = KaldiRecognizer(self.vosk, RATE)    # full vocabulary: what you say, live
+        self.whisper = WhisperModel("base.en", device="cpu", compute_type="int8",
+                                    download_root=str(MODELS / "whisper"), cpu_threads=8)
+        self.piper = PiperVoice.load(str(MODELS / "piper/en_US-lessac-medium.onnx"))
+
+        self.hint = app_hint()
+        self.lock = threading.Lock()
+        self.wake_on = self.load_state()
+        self.mode = "wake"                # wake, record, busy
+        self.mic = None
+        self.speaker = None
+        self.speaking_until = 0.0
+        self.last_wake = 0.0
+        self.noise = 100.0                # running estimate of the room's loudness (offset removed)
+        self.dc = None                    # the mic's DC offset (Mic1 sits ~8,850 off zero), tracked and removed
+        self.followup = False             # listening for a follow-up after GUY answered
+        self.stall = 0                    # chunks since the words last changed
+        self.said = []                    # finished phrases Vosk heard in this utterance
+        self.partial = ""                 # what's shown live
+        self.preroll = deque(maxlen=PREROLL)
+        self.utterance = []
+        self.heard_speech = 0
+        self.quiet = 0
+        self.after_wake = 0
+
+    # ----- settings -----
+    def load_state(self):
+        try:
+            return bool(json.loads(STATE.read_text()).get("wake", True))
+        except (OSError, ValueError):
+            return True
+
+    def save_state(self):
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps({"wake": self.wake_on}))
+
+    # ----- microphone -----
+    def open_mic(self):
+        if self.mic is None:
+            self.mic = subprocess.Popen(["pw-record", "--rate", str(RATE), "--channels", "1", "--format", "s16",
+                                         "-P", STREAM_PROPS, "-"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            threading.Thread(target=self.read_mic, args=(self.mic,), daemon=True).start()
+
+    def close_mic(self):
+        mic, self.mic = self.mic, None
+        if mic and mic.poll() is None:
+            mic.terminate()
+
+    def read_mic(self, mic):
+        while True:
+            data = mic.stdout.read(CHUNK * 2)
+            if not data or len(data) < CHUNK * 2:
+                break
+            with self.lock:
+                self.feed(data)
+        with self.lock:
+            if self.mic is mic:        # pw-record died by itself: try again shortly if we still want it
+                self.mic = None
+                threading.Timer(2.0, self.want_mic).start()
+
+    def want_mic(self):
+        with self.lock:
+            if self.wake_on or self.mode == "record":
+                self.open_mic()
+            else:
+                self.close_mic()
+
+    # ----- listening -----
+    def clean(self, data):
+        """Remove the microphone's DC offset: some laptop mics sit thousands of steps off zero, which
+        reads as constant loud noise and hides your voice from the loudness check."""
+        x = np.frombuffer(data, np.int16).astype(np.float32)
+        mean = float(x.mean())
+        self.dc = mean if self.dc is None else 0.9 * self.dc + 0.1 * mean
+        x -= self.dc
+        return np.clip(x, -32768, 32767).astype(np.int16).tobytes(), float(np.sqrt(np.mean(x ** 2)))
+
+    def heard_so_far(self):
+        return WAKE_WORDS.sub("", " ".join([*self.said, self.partial]).strip()).strip()
+
+    def feed(self, data):
+        data, level = self.clean(data)
+        if self.mode == "wake":
+            self.noise = 0.97 * self.noise + 0.03 * min(level, self.noise * 3)
+            self.preroll.append(data)
+            if time.monotonic() < self.speaking_until:
+                return                      # don't wake on GUY's own voice
+            if self.wake_rec.AcceptWaveform(data):
+                text = json.loads(self.wake_rec.Result()).get("text", "")
+            else:
+                text = json.loads(self.wake_rec.PartialResult()).get("partial", "")
+            if re.search(r"\bhey guy$", text) and time.monotonic() - self.last_wake > COOLDOWN:
+                log("wake word")
+                self.wake_rec.Reset()
+                self.start_recording(list(self.preroll))
+        elif self.mode == "record":
+            self.utterance.append(data)
+            self.after_wake += 1
+            # Vosk writes down what you say as you say it (shown live on the pill), and tells us when a
+            # sentence has ended; loudness is the backup. The first 0.3 s is GUY's own blip.
+            if self.words_rec.AcceptWaveform(data):
+                phrase = json.loads(self.words_rec.Result()).get("text", "")
+                if phrase:
+                    self.said.append(phrase)
+                self.partial = ""
+            else:
+                self.partial = json.loads(self.words_rec.PartialResult()).get("partial", "")
+            words = self.heard_so_far()
+            if words != self.shown:
+                self.shown = words
+                self.stall = 0
+                notify(event="partial", text=words)
+            else:
+                self.stall += 1
+            speech = level > max(self.noise * 3, 150) and self.after_wake > 3
+            if speech:
+                self.heard_speech += 1
+                self.quiet = 0
+            else:
+                self.quiet += 1
+            # finished = no new words for a while (longer if the sentence is left hanging), and it's
+            # gone quiet; background music can keep it from going quiet, so words stopping long enough wins
+            pause = LONG_PAUSE if DANGLING.search(words) else END_PAUSE
+            wait = FOLLOWUP_WAIT if self.followup else NO_SPEECH
+            if words and self.stall >= pause and (self.quiet >= 5 or self.stall >= pause + 10):
+                log("end of speech:", repr(words))
+                self.finish()
+            elif not " ".join([*self.said, self.partial]).strip() and self.heard_speech >= 3 and self.quiet >= END_PAUSE:
+                # Vosk heard nothing at all but something was said: let Whisper try (just "hey guy" doesn't count)
+                log("end of speech (no words from vosk)")
+                self.finish()
+            elif not words and self.after_wake >= wait:
+                log("nothing said" + (" (follow-up window closed)" if self.followup else ""))
+                self.finish(give_up=True)
+            elif len(self.utterance) >= MAX_UTTERANCE:
+                self.finish()
+
+    def start_recording(self, preroll=(), followup=False):
+        self.stop_speaking()
+        self.followup = followup
+        self.stall = 0
+        self.last_wake = time.monotonic()
+        self.mode = "record"
+        self.utterance = list(preroll)
+        self.heard_speech = self.quiet = self.after_wake = 0
+        self.words_rec.Reset()
+        self.said, self.partial, self.shown = [], "", ""
+        for chunk in preroll:                  # so "hey guy lower the…" in one breath is all there
+            self.words_rec.AcceptWaveform(chunk)
+        notify(event="listening")
+        threading.Thread(target=blip, args=(True,), daemon=True).start()
+
+    def finish(self, give_up=False):
+        self.mode = "busy"
+        self.vosk_text = self.heard_so_far()
+        audio = b"".join(self.utterance)
+        self.utterance = []
+        threading.Thread(target=blip, args=(False,), daemon=True).start()
+        if give_up:
+            notify(event="done" if self.followup else "nothing")   # a follow-up nobody used just ends quietly
+            self.back_to_wake()
+            return
+        notify(event="thinking")
+        threading.Thread(target=self.transcribe, args=(audio,), daemon=True).start()
+
+    def transcribe(self, audio):
+        samples = np.frombuffer(audio, np.int16).astype(np.float32) / 32768
+        try:
+            segments, _ = self.whisper.transcribe(samples, beam_size=1, language="en", vad_filter=True,
+                                                  condition_on_previous_text=False, initial_prompt=self.hint)
+            text = " ".join(s.text for s in segments).strip()
+        except Exception as e:  # noqa: BLE001 - report it rather than dying
+            notify(event="error", text=str(e))
+            text = None
+        if text is not None and not WAKE_WORDS.sub("", text).strip() and self.vosk_text:
+            text = self.vosk_text              # Whisper came up empty but Vosk heard something
+        log("whisper:", repr(text))
+        if text is not None:
+            notify(event="heard" if text else "nothing", text=text)
+        with self.lock:
+            self.back_to_wake()
+
+    def back_to_wake(self):
+        self.mode = "wake"
+        self.preroll.clear()
+        self.wake_rec.Reset()
+        if not self.wake_on:
+            self.close_mic()
+
+    # ----- speaking -----
+    def say(self, text, follow=False):
+        log("say:", repr(text[:60]), "(then listen)" if follow else "")
+        self.stop_speaking()
+        try:
+            chunks = self.piper.synthesize(text)
+            first = next(iter(chunks), None)
+        except Exception:  # noqa: BLE001
+            return
+        if first is None:
+            return
+        try:
+            # --raw: samples on stdin, not a sound file (without it pw-play rejects the stream)
+            proc = subprocess.Popen(["pw-play", "--raw", "--rate", str(first.sample_rate), "--channels", "1",
+                                     "--format", "s16", "-P", STREAM_PROPS, "-"],
+                                    stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        except OSError:
+            return
+        self.speaker = proc
+        total = 0
+        try:
+            for chunk in itertools.chain([first], chunks):      # speak each sentence as soon as it's made
+                if self.speaker is not proc:
+                    break
+                data = chunk.audio_int16_bytes
+                total += len(data)
+                self.speaking_until = time.monotonic() + total / 2 / first.sample_rate + 0.8
+                view = memoryview(data)
+                while view and self.speaker is proc:
+                    view = view[proc.stdin.write(view):]
+            proc.stdin.close()
+            proc.wait()
+        except (BrokenPipeError, OSError):
+            log("say: interrupted")
+            return
+        log("say: done", "speaker still ours" if self.speaker is proc else "speaker was stopped", "mode", self.mode)
+        if follow and self.speaker is proc:         # finished, not interrupted: listen for your reply
+            time.sleep(0.25)
+            with self.lock:
+                if self.mode == "wake" and self.speaker is proc:
+                    self.speaker = None
+                    self.open_mic()
+                    self.start_recording(followup=True)
+
+    def stop_speaking(self):
+        proc, self.speaker = self.speaker, None
+        if proc and proc.poll() is None:
+            proc.terminate()
+        self.speaking_until = 0.0
+
+    # ----- commands from GUY / the hotkey -----
+    def command(self, msg):
+        if msg.get("listen"):
+            with self.lock:
+                if self.mode == "record":
+                    self.finish()
+                elif self.mode == "wake":
+                    self.open_mic()
+                    self.start_recording()
+        if "wake" in msg:
+            with self.lock:
+                self.wake_on = (not self.wake_on) if msg["wake"] == "toggle" else bool(msg["wake"])
+                self.save_state()
+                if self.mode == "wake":
+                    self.open_mic() if self.wake_on else self.close_mic()
+            notify(event="wake", on=self.wake_on)
+        if msg.get("stop"):
+            log("stop requested")
+            self.stop_speaking()
+            with self.lock:
+                if self.mode == "record" and self.followup:      # closing the panel ends the conversation
+                    self.utterance = []
+                    self.back_to_wake()
+                    notify(event="done")
+        if msg.get("say"):
+            threading.Thread(target=self.say, args=(str(msg["say"]), bool(msg.get("follow"))), daemon=True).start()
+        if msg.get("status"):
+            notify(event="wake", on=self.wake_on)
+
+    def serve(self):
+        try:
+            VOICE_SOCK.unlink()
+        except FileNotFoundError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(VOICE_SOCK))
+        os.chmod(VOICE_SOCK, 0o600)
+        srv.listen(8)
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                conn.settimeout(1)
+                buf = b""
+                try:
+                    while b"\n" not in buf:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    msg = json.loads(buf.decode(errors="replace") or "{}")
+                except (OSError, ValueError):
+                    continue
+            if isinstance(msg, dict):
+                self.command(msg)
+
+
+def main():
+    voice = Voice()
+    signal.signal(signal.SIGTERM, lambda *_: (voice.close_mic(), voice.stop_speaking(), sys.exit(0)))
+    if voice.wake_on:
+        voice.open_mic()
+    notify(event="wake", on=voice.wake_on)
+    voice.serve()
+
+
+if __name__ == "__main__":
+    main()

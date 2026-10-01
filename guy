@@ -1,0 +1,3443 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+
+
+def _send(message, sock="guy.sock"):
+    """Hand a command to the running GUY (or guy-voice) over its socket (OSError when it isn't running)."""
+    import json
+    import socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        s.connect(os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", sock))
+        s.sendall((json.dumps(message) + "\n").encode())
+
+
+# Alt+Space fast path: a running GUY takes "--ask" over its socket, skipping the ~270 ms of loading
+# GTK just to forward one command. Falls through to the normal start when GUY isn't running.
+if sys.argv[1:] in (["--ask"], ["--home"]):
+    try:
+        _send({"guy_command": sys.argv[1][2:]})
+        sys.exit(0)
+    except OSError:
+        pass
+
+# Voice: Super+Space runs `guy --listen`; `guy --voice on|off|toggle` switches "Hey GUY" listening
+if sys.argv[1:2] in (["--listen"], ["--voice"]):
+    _msg = {"listen": True} if sys.argv[1] == "--listen" else \
+        {"wake": {"on": True, "off": False}.get((sys.argv[2:3] or ["toggle"])[0], "toggle")}
+    try:
+        _send(_msg, "guy-voice.sock")
+    except OSError:
+        print("guy: guy-voice isn't running", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+# Reminders and routines, for you and for GUY's assistant (which sets them by running these):
+#   guy --remind "17:00" "call mom" [--every daily|weekdays|weekly|hourly]
+#   guy --task "08:30" "give me a morning brief: weather, calendar, news" --every weekdays
+#   guy --schedule          list them        guy --unschedule ID
+# WHEN is "YYYY-MM-DD HH:MM", "HH:MM" / "5pm" (the next time it comes round), "tomorrow 9:00" or "+25m".
+SCHEDULE_FILE = os.path.join(os.path.expanduser("~"), ".local/share/guy/schedule.json")
+EVERY = ("daily", "weekdays", "weekly", "hourly")
+
+
+def load_schedule():
+    import json
+    try:
+        with open(SCHEDULE_FILE) as f:
+            items = json.load(f)
+        return items if isinstance(items, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_schedule(items):
+    import json
+    os.makedirs(os.path.dirname(SCHEDULE_FILE), exist_ok=True)
+    with open(SCHEDULE_FILE + ".tmp", "w") as f:
+        json.dump(items, f, indent=1)
+    os.replace(SCHEDULE_FILE + ".tmp", SCHEDULE_FILE)
+
+
+def parse_when(when):
+    """The next datetime `when` describes; ValueError if it doesn't describe one."""
+    import datetime as dt
+    import re
+    w = re.sub(r"\s+", " ", when.strip().lower()).replace(".", "")
+    now = dt.datetime.now().replace(second=0, microsecond=0)
+    if m := re.fullmatch(r"(?:in |\+)(\d+) ?(m|mins?|minutes?|h|hrs?|hours?|d|days?)", w):
+        n, unit = int(m[1]), m[2][0]
+        return now + dt.timedelta(minutes=n * {"m": 1, "h": 60, "d": 1440}[unit])
+    day = None
+    if w.startswith("tomorrow"):
+        day, w = now.date() + dt.timedelta(days=1), w[len("tomorrow"):].strip().removeprefix("at ").strip()
+    elif w.startswith("today"):
+        day, w = now.date(), w[len("today"):].strip().removeprefix("at ").strip()
+    if m := re.fullmatch(r"(\d{1,2})(?::(\d{2}))? ?(am|pm)?", w):
+        h, mi = int(m[1]), int(m[2] or 0)
+        if m[3] == "pm" and h < 12:
+            h += 12
+        if m[3] == "am" and h == 12:
+            h = 0
+        if not m[2] and not m[3]:
+            raise ValueError(f"not a time: {when!r} (say 17:00 or 5pm)")
+        t = dt.datetime.combine(day or now.date(), dt.time(h, mi))
+        return t if day or t > now else t + dt.timedelta(days=1)
+    return dt.datetime.fromisoformat(w.upper().replace(" ", "T") if "-" in w else w)
+
+
+def next_run(at, every):
+    import datetime as dt
+    step = {"daily": dt.timedelta(days=1), "weekdays": dt.timedelta(days=1), "weekly": dt.timedelta(weeks=1),
+            "hourly": dt.timedelta(hours=1)}[every]
+    at += step
+    while every == "weekdays" and at.weekday() >= 5:
+        at += dt.timedelta(days=1)
+    return at
+
+
+if sys.argv[1:2] in (["--remind"], ["--task"], ["--schedule"], ["--unschedule"]):
+    import argparse
+    import datetime as _dt
+    _cmd = sys.argv[1][2:]
+    _items = load_schedule()
+    if _cmd == "schedule":
+        for _i in sorted(_items, key=lambda i: i["at"]):
+            print(f"#{_i['id']}  {_i['kind']:6}  {_i['at'].replace('T', ' ')[:16]}"
+                  f"{'  every ' + _i['every'] if _i.get('every') else ''}  {_i['text']}")
+        if not _items:
+            print("Nothing scheduled.")
+        sys.exit(0)
+    if _cmd == "unschedule":
+        _ids = {a.lstrip("#") for a in sys.argv[2:]}
+        _left = [i for i in _items if str(i["id"]) not in _ids]
+        save_schedule(_left)
+        print(f"Removed {len(_items) - len(_left)}.")
+    else:
+        _ap = argparse.ArgumentParser(prog=f"guy --{_cmd}")
+        _ap.add_argument("when")
+        _ap.add_argument("text", nargs="+")
+        _ap.add_argument("--every", choices=EVERY)
+        _a = _ap.parse_args(sys.argv[2:])
+        try:
+            _at = parse_when(_a.when)
+        except ValueError as _e:
+            print(f"guy: {_e}", file=sys.stderr)
+            sys.exit(2)
+        while _a.every == "weekdays" and _at.weekday() >= 5:
+            _at += _dt.timedelta(days=1)
+        _id = max([i["id"] for i in _items] + [0]) + 1
+        _items.append({"id": _id, "kind": _cmd, "at": _at.isoformat(timespec="minutes"), "text": " ".join(_a.text),
+                       "every": _a.every})
+        save_schedule(_items)
+        print(f"Scheduled #{_id}: {_cmd} {_at:%a %Y-%m-%d %H:%M}{' every ' + _a.every if _a.every else ''}: {' '.join(_a.text)}")
+    try:
+        _send({"guy_command": "schedule"})
+    except OSError:
+        pass
+    sys.exit(0)
+
+# Any script can put a live activity on the island, e.g.
+#   guy --activity backup --title "Backing up" --detail "photos" --progress 0.4
+#   guy --activity backup --title "Backup finished" --done --open ~/Backups
+if sys.argv[1:2] == ["--activity"]:
+    import argparse
+    _ap = argparse.ArgumentParser(prog="guy --activity", description="Show a live activity on GUY's island.")
+    _ap.add_argument("key", help="an id of your choosing; the same id updates the same activity")
+    _ap.add_argument("--title", help="what's happening (defaults to the id)")
+    _ap.add_argument("--detail", default="", help="a second line")
+    _ap.add_argument("--progress", type=float, help="0 to 1, drawn as a bar")
+    _ap.add_argument("--icon", help="an icon name, e.g. emblem-synchronizing-symbolic")
+    _ap.add_argument("--open", help="file, folder or URL to open when it's clicked")
+    _ap.add_argument("--done", action="store_true", help="finished: GUY celebrates, then it fades from the list")
+    _ap.add_argument("--error", action="store_true", help="failed")
+    _ap.add_argument("--clear", action="store_true", help="remove it now")
+    _args = _ap.parse_args(sys.argv[2:])
+    if _args.open:
+        _args.open = os.path.abspath(os.path.expanduser(_args.open)) if "://" not in _args.open else _args.open
+    try:
+        _send({"guy_command": "activity", **vars(_args)})
+    except OSError:
+        print("guy: GUY isn't running", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+# gtk4-layer-shell must load before libwayland-client, so re-exec with it preloaded
+LAYER_LIB = "/usr/lib/libgtk4-layer-shell.so"
+if os.path.exists(LAYER_LIB) and LAYER_LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (LAYER_LIB + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+# the library is already loaded into this process; don't pass the preload on to apps we launch
+# (GTK3 apps such as Discord abort when gtk4-layer-shell is forced into them)
+_preload = [p for p in os.environ.get("LD_PRELOAD", "").split() if p != LAYER_LIB]
+if _preload:
+    os.environ["LD_PRELOAD"] = " ".join(_preload)
+else:
+    os.environ.pop("LD_PRELOAD", None)
+
+# GUY, the Glanceable Utility Yokai: a little Linux penguin in a liquid-glass island that hangs
+# from the top of the screen. It keeps an eye on Claude Code sessions (what they're doing, and
+# Allow / Deny for their permission requests) and grows into Ask GUY, the search bar that used to
+# be spotlight, on Alt+Space. After Coucou (github.com/Louis-CFM/coucou), rebuilt for Hyprland.
+#
+#   guy                    run in the background (started from ~/.config/hypr/hyprland.lua)
+#   guy --ask              open or close Ask GUY; starts GUY if it isn't running
+#   guy --home             open or close the overview (sessions, downloads, updates)
+#   guy --install-hooks    show the change to ~/.claude/settings.json, back it up, write on "y"
+#   guy --uninstall-hooks  remove GUY's hooks from it and nothing else
+#   guy --activity ID ...  show a live activity from any script (guy --activity --help)
+#   guy --listen           talk to GUY now (Super+Space); saying "Hey GUY" does the same (guy-voice)
+#   guy --voice on|off     switch "Hey GUY" listening on or off (the microphone closes when off)
+#
+# Besides Claude Code it follows browser downloads (~/Downloads), pacman / yay as they run
+# (/var/log/pacman.log), and the number of available updates (HyDE's `hyde-shell system.update`).
+# Package runs pop the pill out at each step and let it slide back in; when yay / pacman / sudo sits
+# waiting for you at a terminal (a password, [Y/n], a choice) it stays out until you've answered.
+# Ask GUY also understands plain commands, done right away without asking Claude: "lower sound",
+# "volume 30", "mute", "next song", "pause", "what's playing", "timer 25m", "remind me in 5 minutes
+# to call mom", "cancel timer", and several at once ("lower sound and next song").
+
+import ast
+import difflib
+import json
+import math
+import operator
+import random
+import re
+import shutil
+import signal
+import subprocess
+import termios
+import threading
+import time
+import urllib.parse
+from pathlib import Path
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gsk", "4.0")
+gi.require_version("Graphene", "1.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
+from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+
+try:  # newer GLib moved it; the old name still works but warns
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix  # noqa: E402
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError):
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+HOME = Path.home()
+SOCK = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "guy.sock"
+
+# the layer surface never resizes; the island is drawn inside it and the input region follows it
+SURF_W, SURF_H = 880, 700
+HOT_W, HOT_H = 260, 3            # the strip at the top edge that wakes GUY while it's hidden
+HIDDEN_W = 190
+WIDTHS = {"home": 720, "approval": 720, "ask": 680, "drop": 540}
+SHOULDER, RADIUS, BULGE_MAX = 12.0, 22.0, 14.0
+# The glass copies the terminal (kitty over Hyprland), measured off the screen: kitty's #262626 at
+# its background_opacity 0.62, the lit edge of the window border (~24% white) and its 14px inner
+# glow (~11% white at the rim), rounding 22 at rounding_power 3, and the window drop shadow
+# (~/.config/hypr/glass_edges.lua: range 52, power 3, offset 18). The blur is Hyprland's own.
+GLASS = {
+    "fill": (0x26 / 255, 0x26 / 255, 0x26 / 255, 0.62),
+    "rim_alpha": 0.24,
+    "glow_alpha": 0.11, "glow_range": 14, "glow_power": 2,
+    "power": 3.0,
+    "shadow_alpha": 0.32, "shadow_range": 52, "shadow_power": 2.2, "shadow_offset": 8,
+}
+SHADOW_PAD = 52 + 18 + 12
+MAX_APPS, MAX_WINDOWS, MAX_FILES = 6, 3, 60
+
+WEB_TOOLS = ["WebSearch", "WebFetch"]
+TOOL_STATUS = {"WebSearch": "searching the web…", "WebFetch": "reading a page…", "Read": "reading…",
+               "Bash": "running a command…", "Edit": "editing a file…", "Write": "writing a file…",
+               "Glob": "looking through your files…", "Grep": "looking through your files…"}
+
+# GUY's assistant (Ask GUY, voice, scheduled tasks) is Claude Code with hands: it runs commands, edits
+# files and browses, from your home folder. Every action goes through `guy-hook agent` first, which lets
+# ordinary ones through and asks you on the island about risky ones; nothing is pre-approved, so if the
+# hook can't be reached, nothing happens.
+GUY_DATA = HOME / ".local/share/guy"
+MEMORY = GUY_DATA / "memory.md"
+AGENT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"]
+AGENT_SETTINGS = json.dumps({"hooks": {"PreToolUse": [
+    {"matcher": "*", "hooks": [{"type": "command", "command": f"{HOME}/.local/bin/guy-hook agent", "timeout": 130}]}]}})
+AGENT_SYSTEM = """You are GUY (the Glanceable Utility Yokai): the user's personal assistant, a little penguin living at \
+the top of the screen of their Arch Linux laptop (Hyprland, Waybar, kitty, yay). Like OpenClaw, you don't just \
+answer, you get things done: run shell commands, read and edit files, search and fetch the web, open apps, and \
+remember the user from one conversation to the next.
+
+Now: {now}. You're working in the home folder, {home}.
+
+How to act
+- Don't ask "are you sure?": GUY's safety layer already stops and asks the user before anything risky (deleting, \
+sudo, installing, system changes, sending data out, reading keys). If it tells you they said no, respect that: \
+don't find another way, just say it wasn't done.
+- But do ask when you need something from them. Never just give up:
+  - When something fails, work out why and try another way first (a different command, app, search, or a \
+screenshot to see what's really on screen). Try at least two approaches before deciding you're stuck.
+  - When you're still stuck, or the request is ambiguous (which person, which file, which account, missing \
+details), end your reply with one short, specific question that would let you finish: say what you tried, what \
+went wrong, and offer the likely options ("I found two people called Tae on Discord, Taehyang Kim and Tae Park. \
+Which one?"). The user answers in the same conversation, by voice or typing, and you carry on from there.
+  - Don't stop at "I can't do that" when a way exists that needs something from them (a login, a choice, a \
+missing app to install): ask for it.
+- Prefer reversible actions: move files to the trash with `gio trash` instead of `rm`.
+- Open apps with `uwsm app -- <name>.desktop` (or `gtk-launch`), files and URLs with `xdg-open`, in the background.
+- Answer short: the result first, a sentence or two, light Markdown. Say what you did.
+- Use the web whenever the answer depends on anything current, and mention the source briefly.
+
+Reminders and routines (GUY runs these for you; confirm what you scheduled)
+  guy --remind "WHEN" "text" [--every daily|weekdays|weekly|hourly]   a reminder at a time
+  guy --task "WHEN" "what to do" [--every ...]   you'll be run at that time to do it (e.g. a morning brief)
+  guy --schedule   list them      guy --unschedule ID   remove one
+  WHEN: "YYYY-MM-DD HH:MM", "17:00", "5pm", "tomorrow 9:00", "+25m", "+2h".
+  For countdowns ("in 10 minutes") GUY's timer is simpler: tell the user to say "timer 10 minutes", or use --remind "+10m".
+
+Using the screen, mouse and keyboard (for things with no command-line way: sending a message in Discord,
+clicking through a website or an app)
+  guy-computer screenshot        saves a PNG and prints its path: Read it to see the screen
+  guy-computer windows           open windows with positions      guy-computer focus NAME
+  guy-computer click X Y [--right|--double]     guy-computer scroll X Y up|down [N]
+  guy-computer type "text"       guy-computer key ctrl+k | Return | Escape | Tab | ctrl+shift+t
+  guy-computer send-key Return   the keypress that SENDS a message, email or post to someone (the user is asked first)
+  Coordinates are the screenshot's pixels. Look, act, then take another screenshot to check it worked.
+  Prefer keyboard shortcuts to clicking (Discord: ctrl+k, type the person's name, Return to open the chat,
+  type the message, then send-key Return). Always use send-key, never key, for the final send.
+
+Memory
+{memory_path} is your long-term memory about the user. When they tell you something worth keeping (who they are, \
+preferences, people, projects, routines) or ask you to remember something, add one short dated line to it with \
+Edit or Write; remove lines they ask you to forget. Don't store secrets. What it holds now:
+{memory}"""
+
+
+def agent_system():
+    try:
+        memory = MEMORY.read_text().strip()[-4000:]
+    except OSError:
+        memory = ""
+    return AGENT_SYSTEM.format(now=time.strftime("%A %Y-%m-%d %H:%M %Z"), home=HOME,
+                               memory_path=str(MEMORY).replace(str(HOME), "~", 1), memory=memory or "(nothing yet)")
+
+
+def agent_cmd(resume=None, stream=True):
+    cmd = ["claude", "-p", "--output-format", "stream-json" if stream else "json"]
+    if stream:
+        cmd += ["--include-partial-messages", "--verbose"]
+    cmd += ["--setting-sources", "", "--strict-mcp-config", "--settings", AGENT_SETTINGS,
+            "--system-prompt", agent_system(), "--tools", *AGENT_TOOLS]
+    if resume:
+        cmd += ["--resume", resume]
+    return cmd
+
+CSS = b"""
+window.guy, window.guy.background, window.guy-catcher, window.guy-catcher.background {
+    background: none; box-shadow: none; border: none;
+}
+.page { font-family: Cantarell, sans-serif; color: rgba(255, 255, 255, 0.92); }
+.peek { padding: 5px 18px 6px 12px; }
+.peek-label { font-size: 12.5px; font-weight: 700; }
+.home, .approval { padding: 14px 22px 20px 22px; }
+.head { font-size: 15px; font-weight: 800; }
+.dim { font-size: 12px; color: rgba(255, 255, 255, 0.55); }
+.empty { font-size: 13px; color: rgba(255, 255, 255, 0.66); }
+.session { padding: 6px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.06); }
+.dot { min-width: 8px; min-height: 8px; border-radius: 99px; background: rgba(255, 255, 255, 0.45); }
+.dot.working { background: #6fb8ff; }
+.dot.waiting { background: #ffb347; }
+.dot.done { background: #5fdc9a; }
+.dot.error { background: #ff6b6b; }
+.sname { font-size: 13px; font-weight: 700; }
+.slast { font-size: 12.5px; color: rgba(255, 255, 255, 0.68); }
+.sage { font-size: 11px; color: rgba(255, 255, 255, 0.40); }
+.session.clickable:hover { background: rgba(255, 255, 255, 0.11); }
+.aicon { color: rgba(255, 255, 255, 0.75); }
+.session progressbar trough { min-height: 3px; border-radius: 99px; background: rgba(255, 255, 255, 0.10); border: none; }
+.session progressbar progress { min-height: 3px; border-radius: 99px; background: rgba(255, 255, 255, 0.75); border: none; }
+button.action.small { padding: 2px 10px; font-size: 11.5px; }
+.code {
+    font-family: monospace; font-size: 12px; color: rgba(255, 255, 255, 0.88);
+    background: rgba(0, 0, 0, 0.28); border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 12px; padding: 8px 12px;
+}
+button.action {
+    background: rgba(255, 255, 255, 0.10); color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.22); border-radius: 12px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.30);
+    padding: 6px 14px; min-height: 0; font-weight: 700;
+}
+button.action:hover { background: rgba(255, 255, 255, 0.20); }
+button.action.primary { background: rgba(255, 255, 255, 0.92); color: #15151a; }
+button.action.primary:hover { background: #ffffff; }
+button.action.ghost { background: none; border-color: transparent; box-shadow: none; color: rgba(255, 255, 255, 0.6); }
+button.action.ghost:hover { color: #ffffff; background: rgba(255, 255, 255, 0.08); }
+.drop {
+    margin: 12px 14px 16px 14px; padding: 16px 22px; border-radius: 20px;
+    border: 1.5px dashed rgba(255, 255, 255, 0.45); background: rgba(120, 200, 255, 0.08);
+}
+.search-row { padding: 12px 18px 12px 14px; }
+entry.search {
+    background: transparent; border: none; box-shadow: none; outline: none;
+    font-size: 21px; color: #ffffff; min-height: 40px; padding: 0;
+}
+entry.search > text > placeholder { color: rgba(255, 255, 255, 0.40); }
+entry.search:focus, entry.search:focus-within { outline: none; box-shadow: none; border: none; background: transparent; }
+.chip {
+    font-size: 12px; font-weight: 700; padding: 3px 4px 3px 10px; border-radius: 99px;
+    background: rgba(255, 255, 255, 0.14); border: 1px solid rgba(255, 255, 255, 0.22);
+}
+.chip button { background: none; border: none; box-shadow: none; min-height: 0; min-width: 0; padding: 0 6px; color: rgba(255, 255, 255, 0.7); }
+.sep { background-color: rgba(255, 255, 255, 0.10); min-height: 1px; }
+.page scrolledwindow, .page viewport, list.results { background: transparent; }
+list.results { padding: 6px; }
+list.results > row {
+    border-radius: 12px; padding: 7px 12px; margin: 1px 0;
+    background: transparent; color: rgba(255, 255, 255, 0.88); outline: none;
+}
+list.results > row:selected { background-color: rgba(255, 255, 255, 0.15); color: #ffffff; }
+list.results > row:hover:not(:selected) { background-color: rgba(255, 255, 255, 0.06); }
+.rtitle { font-size: 14px; }
+.calc .rtitle { font-size: 21px; font-weight: 600; }
+.rsub { font-size: 11px; color: rgba(255, 255, 255, 0.5); }
+.hint { font-size: 11px; color: rgba(255, 255, 255, 0.42); }
+.answer-head { padding: 12px 18px 2px 18px; font-size: 12px; color: rgba(255, 255, 255, 0.55); }
+.answer { font-size: 14px; color: rgba(255, 255, 255, 0.93); padding: 6px 18px 14px 18px; }
+.footer { font-size: 10.5px; color: rgba(255, 255, 255, 0.42); padding: 7px 18px 11px 18px; }
+"""
+
+HINT_IDLE = "Type to search apps, windows and math  ·  Tab ask GUY  ·  Alt+F files  ·  Ctrl+Enter web"
+HINT_RESULTS = "↑↓ select  ·  Enter open  ·  Tab ask GUY  ·  Alt+F files  ·  Ctrl+Enter web"
+HINT_ANSWER = "Type a follow-up and press Tab  ·  Ctrl+Shift+C copy answer  ·  Esc back"
+HINT_FILE = "Enter or Tab ask GUY about the file  ·  Esc close"
+
+
+# ---------- Claude Code hooks: install / uninstall ----------
+SETTINGS = HOME / ".claude/settings.json"
+HOOK_BIN = HOME / ".local/bin/guy-hook"
+HOOK_MARKER = "guy-hook"
+# GUY only speaks up when Claude needs you, so it only listens for that: permission requests, and
+# questions (AskUserQuestion, matched so ordinary tool calls never run the relay). The start and end
+# of each turn keep the overview's session list and Claude's last reply current, quietly.
+# (event, timeout, matcher); PermissionRequest waits for a click: the relay's decision budget + 10 s
+HOOK_EVENTS = [("PermissionRequest", 120, None), ("PreToolUse", 10, "AskUserQuestion"),
+               ("PostToolUse", 10, "AskUserQuestion"), ("UserPromptSubmit", 10, None), ("Stop", 10, None),
+               ("StopFailure", 10, None), ("SessionEnd", 10, None)]
+
+
+def _is_ours(entry):
+    return isinstance(entry, dict) and any(
+        isinstance(h, dict) and HOOK_MARKER in str(h.get("command", "")) for h in entry.get("hooks", []))
+
+
+def hooks_merged(cfg, install):
+    """cfg with GUY's hook entries removed and, when installing, added back. Nothing else changes."""
+    cfg = json.loads(json.dumps(cfg))
+    hooks = cfg.get("hooks") if isinstance(cfg.get("hooks"), dict) else {}
+    for event in list(hooks):
+        if isinstance(hooks[event], list):
+            kept = [e for e in hooks[event] if not _is_ours(e)]
+            if kept or len(kept) == len(hooks[event]):
+                hooks[event] = kept
+            else:
+                del hooks[event]
+    if install:
+        for event, timeout, matcher in HOOK_EVENTS:
+            entry = {"hooks": [{"type": "command", "command": f"{HOOK_BIN} {event}", "timeout": timeout}]}
+            if matcher:
+                entry = {"matcher": matcher, **entry}
+            hooks.setdefault(event, []).append(entry)
+    if hooks:
+        cfg["hooks"] = hooks
+    else:
+        cfg.pop("hooks", None)
+    return cfg
+
+
+def hooks_cli(install):
+    try:
+        cfg = json.loads(SETTINGS.read_text() or "{}")
+    except FileNotFoundError:
+        cfg = {}
+    except ValueError:
+        print(f"{SETTINGS} isn't valid JSON. Fix it first; nothing was changed.")
+        return 1
+    after = hooks_merged(cfg, install)
+    if after == cfg:
+        print("Nothing to change.")
+        return 0
+    after_text = json.dumps(after, indent=2) + "\n"
+    print("\n".join(difflib.unified_diff(json.dumps(cfg, indent=2).splitlines(), after_text.splitlines(),
+                                         f"{SETTINGS} (now)", f"{SETTINGS} (after)", lineterm="")))
+    backup = SETTINGS.with_name(f"settings.json.guy-backup-{time.strftime('%Y%m%d-%H%M%S')}")
+    if SETTINGS.exists():
+        print(f"\nThe current file will be copied to {backup}")
+    if input("Write this? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Nothing written.")
+        return 0
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    if SETTINGS.exists():
+        shutil.copy2(SETTINGS, backup)
+    tmp = SETTINGS.with_name("settings.json.guy-tmp")
+    tmp.write_text(after_text)
+    tmp.replace(SETTINGS)
+    print("Done. New Claude Code sessions will report to GUY." if install else "Done. GUY's hooks are gone.")
+    return 0
+
+
+# ---------- calculator ----------
+_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod, ast.Pow: operator.pow,
+        ast.USub: operator.neg, ast.UAdd: operator.pos}
+_NAMES = {k: getattr(math, k) for k in ("pi", "e", "tau", "sqrt", "sin", "cos", "tan", "log", "log10",
+                                         "log2", "exp", "floor", "ceil", "factorial", "radians", "degrees")}
+_NAMES.update(abs=abs, round=round)
+
+
+def _eval(n):
+    if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+        return n.value
+    if isinstance(n, ast.BinOp) and type(n.op) in _OPS:
+        left, right = _eval(n.left), _eval(n.right)
+        if isinstance(n.op, ast.Pow) and abs(right) > 1000:
+            raise ValueError("exponent too large")
+        return _OPS[type(n.op)](left, right)
+    if isinstance(n, ast.UnaryOp) and type(n.op) in _OPS:
+        return _OPS[type(n.op)](_eval(n.operand))
+    if isinstance(n, ast.Name) and n.id in _NAMES and not callable(_NAMES[n.id]):
+        return _NAMES[n.id]
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and callable(_NAMES.get(n.func.id)) and not n.keywords:
+        args = [_eval(a) for a in n.args]
+        if n.func.id == "factorial" and any(abs(a) > 1000 for a in args):
+            raise ValueError("factorial too large")
+        return _NAMES[n.func.id](*args)
+    raise ValueError("unsupported")
+
+
+def calculate(text):
+    expr = text.strip().lstrip("=").replace("^", "**").replace("×", "*").replace("÷", "/")
+    expr = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", expr)
+    if not re.search(r"\d|pi|tau", expr) or not re.search(r"[+\-*/%(]", expr):
+        return None
+    if not re.fullmatch(r"[\w\s.+\-*/%(),]+", expr):
+        return None
+    try:
+        val = _eval(ast.parse(expr, mode="eval").body)
+    except (SyntaxError, ValueError, TypeError, ZeroDivisionError, OverflowError):
+        return None
+    if isinstance(val, float):
+        if val != val or val in (float("inf"), float("-inf")):
+            return None
+        if val.is_integer() and abs(val) < 1e15:
+            val = int(val)
+    return f"{val:,.10g}".replace(",", " ") if isinstance(val, float) else f"{val:,}".replace(",", " ")
+
+
+# ---------- markdown -> pango ----------
+def _inline(text):
+    parts = text.split("`")
+    out = []
+    for i, part in enumerate(parts):
+        esc = GLib.markup_escape_text(part)
+        if i % 2 == 1 and i < len(parts) - 1:
+            out.append(f'<span font_family="monospace" background="#ffffff1c"> {esc} </span>')
+            continue
+        if i % 2 == 1:
+            esc = "`" + esc
+        esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+        esc = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", esc)
+        out.append(esc)
+    return "".join(out)
+
+
+def md_to_markup(text):
+    lines, in_code = [], False
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            lines.append(f'<span font_family="monospace" background="#ffffff14">{GLib.markup_escape_text(line)}</span>')
+            continue
+        if m := re.match(r"^#{1,6}\s+(.*)", line):
+            lines.append(f"<b>{_inline(m.group(1))}</b>")
+        elif m := re.match(r"^(\s*)[-*+]\s+(.*)", line):
+            lines.append(f"{m.group(1)}•  {_inline(m.group(2))}")
+        else:
+            lines.append(_inline(line))
+    return "\n".join(lines)
+
+
+# ---------- data sources ----------
+def load_apps():
+    apps = []
+    for info in Gio.AppInfo.get_all():
+        if not info.should_show() or not isinstance(info, DesktopAppInfo):
+            continue
+        extra = " ".join(filter(None, [info.get_generic_name(), " ".join(info.get_keywords() or []),
+                                       info.get_description(), (info.get_id() or "").removesuffix(".desktop")]))
+        apps.append({"id": info.get_id(), "name": info.get_display_name() or info.get_name(),
+                     "icon": info.get_icon(), "generic": info.get_generic_name() or "",
+                     "extra": extra.lower(), "wmclass": (info.get_startup_wm_class() or "").lower()})
+    return apps
+
+
+def load_windows():
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=2).stdout
+        return [c for c in json.loads(out) if c.get("mapped", True) and c.get("class")]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def score(query, name, extra=""):
+    name = name.lower()
+    total = 0
+    for term in query.lower().split():
+        words = re.split(r"[\s\-_.]+", name)
+        if name.startswith(term):
+            s = 100
+        elif any(w.startswith(term) for w in words):
+            s = 80
+        elif term in name:
+            s = 60
+        elif any(w.startswith(term) for w in re.split(r"[\s\-_.;,]+", extra)):
+            s = 40
+        elif len(term) > 2 and term in extra:
+            s = 20
+        else:
+            return 0
+        total += s
+    return total - len(name) / 100
+
+
+def spawn(*cmd):
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+# ---------- things you can just say: volume, music, timers ----------
+SINK = "@DEFAULT_AUDIO_SINK@"
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def get_volume():
+    out = run("wpctl", "get-volume", SINK)             # "Volume: 0.50 [MUTED]"
+    m = re.search(r"([\d.]+)", out)
+    return (round(float(m.group(1)) * 100) if m else None), "MUTED" in out
+
+
+def fmt_duration(secs):
+    secs = int(secs)
+    h, m, s = secs // 3600, secs % 3600 // 60, secs % 60
+    if h:
+        return f"{h}h {m}m" if m else f"{h}h"
+    if m:
+        return f"{m}m {s}s" if s else f"{m} min"
+    return f"{s}s"
+
+
+def clock(secs):
+    secs = max(0, int(round(secs)))
+    h, m, s = secs // 3600, secs % 3600 // 60, secs % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def parse_duration(text):
+    """'25m', '1h 30m', '90 seconds', '10 minutes', '1:30', or a bare number of minutes -> seconds."""
+    total, found = 0.0, False
+    for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", text):
+        found = True
+        total += float(num) * {"h": 3600, "m": 60, "s": 1}[unit[0]]
+    if not found and (m := re.search(r"\b(\d+):(\d{2})\b", text)):
+        total, found = int(m[1]) * 60 + int(m[2]), True
+    if not found and (m := re.search(r"\b(\d+(?:\.\d+)?)\b", text)):
+        total, found = float(m[1]) * 60, True
+    return int(total) if found and total > 0 else None
+
+
+NUMBER_WORDS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
+    "seventeen eighteen nineteen".split())}
+NUMBER_WORDS.update({w: 20 + 10 * i for i, w in enumerate("twenty thirty forty fifty sixty seventy eighty ninety".split())})
+
+
+def words_to_digits(t):
+    """Spoken numbers as digits, for timers and volume: "twenty five minutes" -> "25 minutes"."""
+    t = re.sub(r"\bhalf an? hour\b", "30 minutes", t)
+    t = re.sub(r"\ban? (hour|minute|second)\b", r"1 \1", t)
+    t = re.sub(r"\ba hundred\b|\bone hundred\b", "100", t)
+
+    def compound(m):
+        tens, unit = NUMBER_WORDS[m[1]], NUMBER_WORDS.get(m[2] or "", 0)
+        return str(tens + unit)
+    t = re.sub(r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[ -](one|two|three|four|five|six|seven|eight|nine))?\b",
+               compound, t)
+    return re.sub(r"\b(" + "|".join(NUMBER_WORDS) + r")\b", lambda m: str(NUMBER_WORDS[m[1]]), t)
+
+
+def speakable(text, limit=600):
+    """Text as it should sound: no Markdown, code or links; long answers trimmed at a sentence."""
+    t = re.sub(r"```.*?```", " I've put the code on screen. ", text, flags=re.S)
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    t = re.sub(r"https?://\S+", "", t)
+    t = re.sub(r"^[#>*•\s-]+", "", t, flags=re.M)
+    t = re.sub(r"[*_]{1,2}", "", t)
+    t = re.sub(r"(\d)\s*%", r"\1 percent", t)
+    t = t.replace("·", ",").replace("♪", "").replace("⏰", "").replace("→", "to")
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > limit:
+        cut = max(t.rfind(". ", 0, limit), t.rfind("? ", 0, limit), t.rfind("! ", 0, limit))
+        t = (t[:cut + 1] if cut > 80 else t[:limit]) + " The rest is on screen."
+    return t
+
+
+# the wake phrase as it tends to come out of the recognisers ("a guy", "hey kai", "okay guys")
+WAKE_PREFIX = re.compile(r"^\W*(?:\w+\W+)?(?:guys?|guy's|kai|kay|gay|guide?)\b\W*", re.I)   # any one word, then "guy"
+
+VOL_WORDS = r"\b(volume|sound|audio|it|music)\b"
+MUSIC = r"(?: (?:the )?(?:one|song|track|music|tune|this(?: song| track| one)?))?"
+
+
+def intent_one(t):
+    """One plain-language command -> (action, argument, what GUY will do), or None."""
+    t = re.sub(r"^(?:please |hey guy,? |guy,? |can you |could you |would you |will you |i want to |i wanna |"
+               r"i'd like to |id like to |lets |let's |go ahead and |just |now |and )+", "", t).strip()
+    t = re.sub(r"(?: please| for me| now| right now| real quick)+$", "", t).strip()
+    # ending the conversation / stopping GUY talking
+    if re.fullmatch(r"stop talking|shut up|be quiet|quiet|cancel|never ?mind|forget (?:it|about it)|thanks?(?: guy)?|"
+                    r"thank you(?: guy)?|(?:ok|okay|cool|great|perfect|awesome)(?:,? thanks?| thank you)?|"
+                    r"that(?:s| is) (?:all|it)|nothing|no|nope|no thanks|bye|goodbye|im good|all good", t):
+        return "dismiss", None, "Never mind"
+    # timers
+    if re.search(r"\b(cancel|stop|clear|delete|kill)\b.*\b(timers?|reminders?)\b", t):
+        return "timer-cancel", None, "Cancel the timers"
+    if re.search(r"\b(timer|remind me|countdown|alarm)\b", t):
+        if re.search(r"\bat \d|\b(am|pm|tomorrow|tonight|oclock|o clock|noon|midnight|morning|evening|monday|tuesday|"
+                     r"wednesday|thursday|friday|saturday|sunday|every)\b", t):
+            return None     # a time of day, not a countdown: GUY's assistant schedules it (guy --remind)
+        t = words_to_digits(t)
+        secs = parse_duration(t)
+        if secs:
+            m = re.search(r"\bto (.+)$", t) or re.search(r"\bfor (?!\d)(?!an? )(.+)$", t)
+            label = m[1].strip() if m else ""
+            label = re.sub(r"\b(in |for )?\d+(\.\d+)?\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", "", label).strip()
+            return "timer", (secs, label), f"Start a {fmt_duration(secs)} timer" + (f": {label}" if label else "")
+        return None
+    # system update: yay -Syu in a terminal ("update" alone isn't enough, it could be a search)
+    if re.fullmatch(r"(?:run |do |start )?(?:an? |the )?(?:system|package|full|arch) (?:update|upgrade)s?(?: now)?"
+                    r"|(?:update|upgrade)(?: (?:all|my|the|of|every))*"
+                    r" (?:packages?|system|computer|laptop|arch|everything|pc|software|apps|stuff|yay)(?: now)?"
+                    r"|(?:check for and )?install(?: the| all| any)? updates"
+                    r"|(?:run )?yay(?: -syu)?|(?:run )?(?:sudo )?pacman -syu", t):
+        return "update-system", None, "Update packages: yay -Syu in a terminal"
+    # volume
+    if re.fullmatch(r"(?:un-?mute|unmute (?:the )?(?:sound|volume|audio|it))"
+                    r"|(?:enable|turn on|switch on|bring back) (?:the )?(?:sound|audio|volume|speakers?)(?: back)?"
+                    r"|(?:turn|put|bring) (?:the )?(?:sound|audio) back on", t):
+        return "unmute", None, "Unmute"
+    if re.fullmatch(r"(?:mute|mute (?:the )?(?:sound|volume|audio|it|music)|silence)"
+                    r"|(?:disable|turn off|switch off|kill|cut|shut off) (?:the )?(?:sound|audio|volume|speakers?)", t):
+        return "mute", None, "Mute"
+    tn = words_to_digits(t)
+    m = re.search(r"\b(?:volume|sound)\b(?: (?:to|at))? (\d{1,3}) ?(?:%|percent)?$", tn) \
+        or re.fullmatch(r"(?:set )?volume (\d{1,3}) ?(?:%|percent)?", tn)
+    if m:
+        return "volume-set", min(100, int(m[1])), f"Set the volume to {min(100, int(m[1]))}%"
+    if re.fullmatch(r"(?:max|maximum|full)(?: volume| sound)?|(?:turn |put )?(?:the )?(?:volume|sound|it) (?:all the way )?up to (?:max|maximum|full)", t):
+        return "volume-set", 100, "Set the volume to 100%"
+    if re.fullmatch(r"half(?: volume)?|(?:set |put )?(?:the )?volume (?:at|to) half", t):
+        return "volume-set", 50, "Set the volume to 50%"
+    step = 10
+    if m := re.search(r"\bby (\d{1,3}) ?(?:%|percent)?", tn):
+        step = int(m[1])
+    elif re.search(r"\b(a (little )?bit|slightly|a little|a touch)\b", t):
+        step = 5
+    elif re.search(r"\b(a lot|way)\b", t):
+        step = 25
+    if re.search(r"\b(lower|decrease|reduce|drop|(?:turn|put|bring) (?:\w+ ){0,3}down|volume down|sound down)\b", t) \
+            and re.search(VOL_WORDS, t) \
+            or re.search(r"\b(quieter|softer)\b", t):
+        return "volume-down", step, f"Turn the volume down {step}%"
+    if re.search(r"\b(raise|increase|boost|pump up|crank|(?:turn|put|bring) (?:\w+ ){0,3}up|volume up|sound up)\b", t) \
+            and re.search(VOL_WORDS, t) \
+            or re.search(r"\blouder\b", t):
+        return "volume-up", step, f"Turn the volume up {step}%"
+    # music
+    if re.fullmatch(r"(?:play |go to |skip to )?(?:the )?(?:next|skip)" + MUSIC + r"|skip(?: (?:it|this))?"
+                    r"|(?:change|switch) (?:the |this )?(?:song|track|music|tune)|play (?:something|anything) else"
+                    r"|(?:another|a different) (?:song|track|one)|i (?:dont|do not) like this(?: song)?", t):
+        return "next", None, "Next track"
+    if re.fullmatch(r"(?:play |go (?:back )?to )?(?:the )?(?:previous|prev|last)" + MUSIC + r"|go back(?: a (?:song|track))?"
+                    r"|(?:play )?(?:that|this|it|the last one)(?: song| track)? again|replay(?: that| it| the last one)?", t):
+        return "previous", None, "Previous track"
+    if re.fullmatch(r"(?:pause|stop)(?: (?:the )?(?:music|song|track|it|playback|spotify))?", t):
+        return "pause", None, "Pause the music"
+    if re.fullmatch(r"(?:play|resume|unpause|continue)(?: (?:the )?(?:music|song|track|it|playback|spotify))?", t):
+        return "play", None, "Play"
+    if re.fullmatch(r"what(?:s| is)(?: this)?(?: song)? playing|what(?:s| is) this(?: song)?|what song is (?:this|playing)|now playing", t):
+        return "whats-playing", None, "What's playing?"
+    # opening things: an app (or its window, if it's already open), a folder, a website
+    m = re.fullmatch(r"(?:open|launch|start|run|bring up|pull up|switch to|go to|take me to|show me|fire up)(?: up)?"
+                     r" (?:the |my |a |an )?(.+?)(?: (?:app|application|program|window))?", t)
+    if m and not re.search(r"\b(song|track|music)\b", m[1]):
+        return "open", m[1], f"Open {m[1]}"
+    return None
+
+
+FILLER = {"hey", "hi", "a", "uh", "um", "so", "okay", "ok", "oh", "and", "yo", "now", "guy", "guys", "well"}
+
+
+def command_candidates(text):
+    """What was said, and the same without a misheard wake phrase or filler in front ("Hey Kai, skip song")."""
+    t = text.strip()
+    yield t
+    if (m := re.match(r"^([^,.!?]{1,25})[,.!?]\s+(.+)$", t)) and len(m[1].split()) <= 3:
+        yield m[2]
+    words = t.split()
+    while len(words) > 1 and re.sub(r"\W", "", words[0].lower()) in FILLER:
+        words = words[1:]
+        yield " ".join(words)
+
+
+def intents(text):
+    """Every command in the text ("lower sound and next song"), or None unless all of it is understood."""
+    t = re.sub(r"['’]", "", text.lower()).strip().rstrip(".!?")     # "what's" and "whats" alike
+    if not t:
+        return None
+    parts = [p for p in re.split(r"\s*(?:,|;|\band then\b|\bthen\b|\band\b)\s*", t) if p]
+    found = [intent_one(p) for p in parts]
+    if len(parts) > 1 and all(found):
+        return found
+    one = intent_one(t)
+    return [one] if one else None
+
+
+def describe_tool(tool, inp):
+    """What a Claude Code tool call is doing, in a few words."""
+    inp = inp if isinstance(inp, dict) else {}
+    path = os.path.basename(str(inp.get("file_path") or inp.get("notebook_path") or ""))
+    if tool == "Bash":
+        return "$ " + (str(inp.get("command", "")).strip().splitlines() or [""])[0]
+    if tool in ("Edit", "MultiEdit", "NotebookEdit"):
+        return f"Editing {path}"
+    if tool == "Write":
+        return f"Writing {path}"
+    if tool == "Read":
+        return f"Reading {path}"
+    if tool in ("Grep", "Glob"):
+        return f"Searching {inp.get('pattern', '')}"
+    if tool == "WebFetch":
+        return f"Fetching {urllib.parse.urlparse(str(inp.get('url', ''))).netloc}"
+    if tool == "WebSearch":
+        return f"Searching the web for {inp.get('query', '')}"
+    if tool in ("Task", "Agent"):
+        return f"Delegating: {inp.get('description', '')}"
+    return tool or "Working"
+
+
+def question_text(inp):
+    """The first question of an AskUserQuestion call."""
+    inp = inp if isinstance(inp, dict) else {}
+    qs = inp.get("questions")
+    if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+        return str(qs[0].get("question") or qs[0].get("header") or "a question")
+    return str(inp.get("question") or "a question")
+
+
+def tool_detail(tool, inp):
+    """The part of a permission request worth reading before clicking Allow."""
+    inp = inp if isinstance(inp, dict) else {}
+    if tool == "Bash":
+        return str(inp.get("command", ""))
+    for key in ("file_path", "notebook_path", "url", "query", "pattern"):
+        if inp.get(key):
+            return str(inp[key]).replace(str(HOME), "~", 1)
+    return json.dumps(inp, indent=1)[:600]
+
+
+def age(ts):
+    s = time.time() - ts
+    return "now" if s < 60 else f"{int(s // 60)}m" if s < 3600 else f"{int(s // 3600)}h"
+
+
+# ---------- GUY himself: a little Linux penguin ----------
+MOODS = {  # the light behind him: (unused), glow colour
+    "idle": ((0.88, 0.96, 1.00), (0.50, 0.76, 1.00)),
+    "working": ((0.80, 0.90, 1.00), (0.36, 0.56, 1.00)),
+    "waiting": ((1.00, 0.94, 0.78), (1.00, 0.68, 0.28)),
+    "done": ((0.84, 1.00, 0.92), (0.34, 0.84, 0.60)),
+    "error": ((1.00, 0.86, 0.86), (0.95, 0.42, 0.46)),
+    "listening": ((0.86, 0.98, 1.00), (0.40, 0.86, 1.00)),
+}
+
+
+class Face(Gtk.DrawingArea):
+    """Drawn in cairo every frame while it's on screen; costs nothing once the island hides it."""
+
+    def __init__(self, size, owner):
+        super().__init__()
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_valign(Gtk.Align.CENTER)
+        self.size, self.owner = size, owner
+        self.mood = "idle"
+        self.colors = [list(c) for c in MOODS["idle"]]
+        self.look = [0.0, 0.0]
+        self.squish, self.squish_v = 0.0, 0.0
+        self.blink_at = time.monotonic() + random.uniform(1.5, 4)
+        self.dizzy_until = 0.0
+        self.pokes = []
+        self.tick = None
+        self.last = None
+        self.set_draw_func(self.draw)
+        self.connect("map", self.on_map)
+        self.connect("unmap", self.on_unmap)
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda *_: self.poke())
+        self.add_controller(click)
+
+    def on_map(self, _w):
+        if self.tick is None:
+            self.last = None
+            self.tick = self.add_tick_callback(self.on_tick)
+
+    def on_unmap(self, _w):
+        if self.tick is not None:
+            self.remove_tick_callback(self.tick)
+            self.tick = None
+
+    def poke(self):
+        self.squish_v -= 7.0
+        now = time.monotonic()
+        self.pokes = [t for t in self.pokes if now - t < 1.2] + [now]
+        if len(self.pokes) >= 3:
+            self.dizzy_until = now + 3.0
+            self.pokes = []
+
+    def on_tick(self, _w, clock):
+        t = clock.get_frame_time() / 1e6
+        dt = min(1 / 30, t - self.last) if self.last else 1 / 60
+        self.last = t
+        # squish spring, underdamped so a poke wobbles
+        self.squish_v += (-180 * self.squish - 9 * self.squish_v) * dt
+        self.squish += self.squish_v * dt
+        target = MOODS.get(self.mood, MOODS["idle"])
+        for cur, tgt in zip(self.colors, target):
+            for i in range(3):
+                cur[i] += (tgt[i] - cur[i]) * min(1, dt * 6)
+        # eyes: the pointer when it's over the island, otherwise a slow look around
+        px = self.owner.pointer
+        if self.mood == "working" and px is None:
+            want = (math.sin(t * 1.7) * 0.8, 0.1)
+        elif px is not None:
+            ok, p = self.compute_point(self.get_root(), Graphene.Point().init(self.size / 2, self.size / 2))
+            dx, dy = (px[0] - p.x, px[1] - p.y) if ok else (0, 0)
+            want = (max(-1, min(1, dx / 160)), max(-1, min(1, dy / 120)))
+        else:
+            want = (math.sin(t * 0.35) * 0.3, 0.0)
+        for i in range(2):
+            self.look[i] += (want[i] - self.look[i]) * min(1, dt * 8)
+        self.queue_draw()
+        return True
+
+    def draw(self, _area, cr, width, height):
+        now = time.monotonic()
+        S = min(width, height)
+        cx = width / 2
+        oy = (height - S) / 2
+
+        def Y(f):
+            return oy + f * S
+
+        def ellipse(x, y, rx, ry):
+            cr.save()
+            cr.translate(x, y)
+            cr.scale(max(rx, 0.01), max(ry, 0.01))
+            cr.arc(0, 0, 1, 0, 2 * math.pi)
+            cr.restore()
+
+        breath = math.sin(now * 2.2) * 0.015
+        sq = self.squish
+        (r1, g1, b1), (r2, g2, b2) = self.colors
+        dizzy = now < self.dizzy_until
+
+        # his mood shows as coloured light behind him, like something glowing through glass
+        glow = cairo.RadialGradient(cx, Y(0.56), 0, cx, Y(0.56), S * 0.5)
+        glow.add_color_stop_rgba(0, r2, g2, b2, 0.42)
+        glow.add_color_stop_rgba(1, r2, g2, b2, 0)
+        cr.set_source(glow)
+        cr.paint()
+        # the floor he stands on
+        sh = cairo.RadialGradient(cx, Y(0.95), 0, cx, Y(0.95), S * 0.3)
+        sh.add_color_stop_rgba(0, 0, 0, 0, 0.35)
+        sh.add_color_stop_rgba(1, 0, 0, 0, 0)
+        cr.save()
+        cr.translate(cx, Y(0.95))
+        cr.scale(1, 0.2)
+        cr.translate(-cx, -Y(0.95))
+        cr.set_source(sh)
+        cr.arc(cx, Y(0.95), S * 0.3, 0, 2 * math.pi)
+        cr.fill()
+        cr.restore()
+
+        cr.save()
+        base_y = Y(0.94)
+        cr.translate(cx, base_y)
+        cr.rotate(self.look[0] * 0.06)
+        cr.scale(1 - sq * 0.10 + breath * 0.5, 1 + sq * 0.14 + breath)
+        cr.translate(-cx, -base_y)
+
+        dark_top, dark_bottom = (0.19, 0.20, 0.25), (0.06, 0.06, 0.08)
+        feathers = cairo.LinearGradient(cx - S * 0.3, Y(0.1), cx + S * 0.3, Y(0.95))
+        feathers.add_color_stop_rgb(0, *dark_top)
+        feathers.add_color_stop_rgb(1, *dark_bottom)
+
+        # flippers: hanging at his sides, the right one waving when something is done
+        wave = self.mood == "done" and not dizzy
+        for side in (-1, 1):
+            a = 0.35
+            if side == 1 and wave:
+                a = 2.3 + math.sin(now * 10) * 0.35
+            elif self.mood == "waiting":
+                a = 0.6 + math.sin(now * 6 + side) * 0.08
+            cr.save()
+            cr.translate(cx + side * S * 0.22, Y(0.46))
+            cr.rotate(-side * a)
+            ellipse(0, S * 0.15, S * 0.06, S * 0.17)
+            cr.set_source(feathers)
+            cr.fill()
+            cr.restore()
+
+        # body and head
+        cr.new_path()
+        ellipse(cx, Y(0.62), S * 0.27, S * 0.31)
+        cr.new_sub_path()
+        ellipse(cx, Y(0.29), S * 0.19, S * 0.18)
+        body = cr.copy_path()
+        cr.set_source(feathers)
+        cr.fill()
+
+        # belly
+        belly = cairo.LinearGradient(0, Y(0.42), 0, Y(0.92))
+        belly.add_color_stop_rgb(0, 1.0, 0.99, 0.96)
+        belly.add_color_stop_rgb(1, 0.86, 0.87, 0.90)
+        ellipse(cx, Y(0.67), S * 0.19, S * 0.245)
+        cr.set_source(belly)
+        cr.fill()
+
+        # feet
+        for side in (-1, 1):
+            ellipse(cx + side * S * 0.11, Y(0.925), S * 0.1, S * 0.042)
+            cr.set_source_rgb(0.98, 0.66, 0.14)
+            cr.fill()
+
+        # a soft glassy highlight on his head and a thin rim, so he sits in the same light as the island
+        cr.save()
+        cr.translate(cx - S * 0.08, Y(0.19))
+        cr.rotate(-0.6)
+        cr.scale(S * 0.07, S * 0.04)
+        hl = cairo.RadialGradient(0, 0, 0, 0, 0, 1)
+        hl.add_color_stop_rgba(0, 1, 1, 1, 0.35)
+        hl.add_color_stop_rgba(1, 1, 1, 1, 0)
+        cr.set_source(hl)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.fill()
+        cr.restore()
+        cr.append_path(body)
+        cr.set_source_rgba(1, 1, 1, 0.14)
+        cr.set_line_width(max(0.6, S * 0.01))
+        cr.stroke()
+
+        # eyes
+        ey = Y(0.265) + self.look[1] * S * 0.012
+        lx = self.look[0] * S * 0.02
+        erx, ery = S * 0.058, S * 0.075
+        if self.mood == "waiting":
+            erx, ery = erx * 1.1, ery * 1.15
+        blink = 1.0
+        if now > self.blink_at:
+            k = (now - self.blink_at) / 0.14
+            if k >= 1:
+                self.blink_at = now + random.uniform(2.5, 6)
+            else:
+                blink = max(0.08, abs(1 - 2 * k))
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_width(max(1.0, S * 0.028))
+        for side in (-1, 1):
+            x = cx + side * S * 0.072 + lx
+            if dizzy:
+                cr.set_source_rgb(1, 1, 1)
+                cr.new_path()
+                spin = now * 8 * side
+                for i in range(36):
+                    a = spin + i * 0.45
+                    rr = erx * 1.2 * i / 36
+                    cr.line_to(x + math.cos(a) * rr, ey + math.sin(a) * rr)
+                cr.stroke()
+            elif self.mood == "done":
+                cr.set_source_rgb(1, 1, 1)
+                cr.new_path()
+                cr.arc(x, ey + ery * 0.4, erx * 0.95, math.pi * 1.1, math.pi * 1.9)
+                cr.stroke()
+            elif self.mood == "error":
+                cr.set_source_rgb(1, 1, 1)
+                d = erx * 0.8
+                cr.move_to(x - d, ey - d)
+                cr.line_to(x + d, ey + d)
+                cr.move_to(x + d, ey - d)
+                cr.line_to(x - d, ey + d)
+                cr.stroke()
+            else:
+                ellipse(x, ey, erx, ery * blink)
+                cr.set_source_rgb(1, 1, 1)
+                cr.fill()
+                if blink > 0.5:
+                    px = x + self.look[0] * erx * 0.4
+                    py = ey + ery * 0.15 + self.look[1] * ery * 0.3
+                    ellipse(px, py, erx * 0.52, ery * 0.52 * blink)
+                    cr.set_source_rgb(0.05, 0.05, 0.07)
+                    cr.fill()
+                    cr.arc(px + erx * 0.2, py - ery * 0.22, erx * 0.18, 0, 2 * math.pi)
+                    cr.set_source_rgba(1, 1, 1, 0.9)
+                    cr.fill()
+
+        # beak
+        by = Y(0.345)
+        bw = S * 0.085
+        beak = cairo.LinearGradient(0, by - S * 0.04, 0, by + S * 0.05)
+        beak.add_color_stop_rgb(0, 1.0, 0.82, 0.25)
+        beak.add_color_stop_rgb(1, 0.93, 0.52, 0.08)
+        cr.move_to(cx - bw + lx, by)
+        cr.curve_to(cx - bw * 0.6 + lx, by - S * 0.045, cx + bw * 0.6 + lx, by - S * 0.045, cx + bw + lx, by)
+        cr.curve_to(cx + bw * 0.45 + lx, by + S * 0.05, cx - bw * 0.45 + lx, by + S * 0.05, cx - bw + lx, by)
+        cr.close_path()
+        cr.set_source(beak)
+        cr.fill()
+        cr.restore()
+
+
+# ---------- the island: a liquid-glass shape hanging from the top edge ----------
+def squircle_corner(cr, cx, cy, r, t0, t1, steps=14):
+    """A quarter superellipse like Hyprland's rounding_power corners, from angle t0 to t1."""
+    for i in range(steps + 1):
+        t = t0 + (t1 - t0) * i / steps
+        c, n = math.cos(t), math.sin(t)
+        cr.line_to(cx + math.copysign(abs(c) ** (2 / GLASS["power"]), c) * r,
+                   cy + math.copysign(abs(n) ** (2 / GLASS["power"]), n) * r)
+
+
+def island_path(cr, L, R, h, s, r, bulge, closed=True):
+    cx = (L + R) / 2
+    cr.move_to(L - s, 0)
+    cr.arc(L - s, s, s, -math.pi / 2, 0)                  # concave shoulder into the screen edge
+    cr.line_to(L, h - r)
+    squircle_corner(cr, L + r, h - r, r, math.pi, math.pi / 2)
+    cr.curve_to((L + r + cx) / 2, h + bulge, (R - r + cx) / 2, h + bulge, R - r, h)   # the drip
+    squircle_corner(cr, R - r, h - r, r, math.pi / 2, 0)
+    cr.line_to(R, s)
+    cr.arc(R + s, s, s, math.pi, math.pi * 1.5)
+    if closed:
+        cr.close_path()
+
+
+def draw_glass(cr, L, R, h, s, r, bulge):
+    g = GLASS
+
+    # drop shadow, outside the glass only, and faded out toward the bar so it doesn't smudge it
+    cr.save()
+    pad = g["shadow_range"] + s + 4
+    cr.rectangle(L - pad, 0, (R - L) + 2 * pad, h + bulge + g["shadow_offset"] + g["shadow_range"] + 4)
+    island_path(cr, L, R, h, s, r, bulge)
+    cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+    cr.clip()
+    cr.set_fill_rule(cairo.FILL_RULE_WINDING)
+    cr.push_group()
+    cr.translate(0, g["shadow_offset"])
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    steps = 13
+    # fades from the glass's own edge, so there's no flat band under it on light backgrounds
+    start = 0.0
+
+    def shade(d):
+        return g["shadow_alpha"] * max(0.0, 1 - d / g["shadow_range"]) ** g["shadow_power"]
+
+    island_path(cr, L, R, h, s, r, bulge)
+    cr.set_source_rgba(0, 0, 0, shade(start))
+    cr.fill()
+    step = (g["shadow_range"] - start) / steps
+    for k in range(1, steps + 1):
+        d = start + step * k
+        island_path(cr, L, R, h, s, r, bulge)
+        cr.set_source_rgba(0, 0, 0, shade(d - step) - shade(d))
+        d -= start
+        cr.set_line_width(2 * d)
+        cr.stroke()
+    cr.pop_group_to_source()
+    fade = cairo.LinearGradient(0, 0, 0, max(h * 0.8, 24))
+    fade.add_color_stop_rgba(0, 0, 0, 0, 0)
+    fade.add_color_stop_rgba(1, 0, 0, 0, 1)
+    cr.mask(fade)
+    cr.restore()
+
+    # the glass itself: the terminal's background colour at the terminal's opacity, blurred by Hyprland
+    island_path(cr, L, R, h, s, r, bulge)
+    cr.set_source_rgba(*g["fill"])
+    cr.fill()
+
+    # inner glow: white at the rim fading to nothing, the same falloff as the terminal's lit edge
+    cr.save()
+    island_path(cr, L, R, h, s, r, bulge)
+    cr.clip()
+
+    def glow(d):
+        return g["glow_alpha"] * max(0.0, 1 - d / g["glow_range"]) ** g["glow_power"]
+
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    for k in range(int(g["glow_range"]), 0, -1):
+        island_path(cr, L, R, h, s, r, bulge, closed=False)
+        cr.set_source_rgba(1, 1, 1, glow(k - 1) - glow(k))
+        cr.set_line_width(2 * k)
+        cr.stroke()
+    cr.restore()
+
+    # the 1px rim, even all the way round
+    island_path(cr, L, R, h, s, r, bulge, closed=False)
+    cr.set_source_rgba(1, 1, 1, g["rim_alpha"])
+    cr.set_line_width(1.0)
+    cr.stroke()
+
+
+class Island(Gtk.Widget):
+    __gtype_name__ = "GuyIsland"
+
+    def __init__(self, content):
+        super().__init__()
+        self.content = content
+        content.set_parent(self)
+        self.w, self.h, self.vw, self.vh = float(HIDDEN_W), 0.0, 0.0, 0.0
+        self.tw, self.th = float(HIDDEN_W), 0.0
+        self.alpha = 0.0
+        self.follow = False      # the target height tracks the content's natural height
+        self.on_target = None    # called when following changes the target
+
+    def geometry(self):
+        s = min(SHOULDER + min(abs(self.vw) * 0.006, 8), self.h / 2)
+        r = max(0.0, min(RADIUS, self.h / 2, self.w / 2))
+        # it drips a little as it grows; going away it just retracts, straight up
+        bulge = min(self.vh * 0.012, BULGE_MAX) if self.h > 8 and self.vh > 0 else 0.0
+        return s, r, bulge
+
+    def do_measure(self, orientation, _for_size):
+        n = SURF_W if orientation == Gtk.Orientation.HORIZONTAL else SURF_H
+        return n, n, -1, -1
+
+    def page_height(self, widget, width):
+        return min(widget.measure(Gtk.Orientation.VERTICAL, int(width))[1], SURF_H - SHADOW_PAD)
+
+    def do_size_allocate(self, width, _height, _baseline):
+        if not self.content.get_visible():
+            return
+        tw = int(self.tw)
+        ch = self.page_height(self.content, tw)
+        if self.follow and abs(ch - self.th) > 0.5:
+            self.th = float(ch)
+            if self.on_target:
+                GLib.idle_add(self.on_target)
+        t = Gsk.Transform.new().translate(Graphene.Point().init((width - tw) / 2, 0))
+        self.content.allocate(tw, ch, -1, t)
+
+    def do_snapshot(self, snap):
+        if self.h < 0.5:
+            return
+        s, r, bulge = self.geometry()
+        L = self.get_width() / 2 - self.w / 2
+        R = L + self.w
+        cr = snap.append_cairo(Graphene.Rect().init(L - s - SHADOW_PAD, 0, self.w + 2 * (s + SHADOW_PAD),
+                                                    self.h + bulge + SHADOW_PAD))
+        draw_glass(cr, L, R, self.h, s, r, bulge)
+        if self.alpha > 0.01 and self.content.get_visible():
+            rr = Gsk.RoundedRect()
+            zero, rad = Graphene.Size().init(0, 0), Graphene.Size().init(r, r)
+            rr.init(Graphene.Rect().init(L, 0, self.w, self.h), zero, zero, rad, rad)
+            snap.push_rounded_clip(rr)
+            snap.push_opacity(self.alpha)
+            snap.save()
+            snap.translate(Graphene.Point().init(0, -(1 - self.alpha) * 10))
+            self.snapshot_child(self.content, snap)
+            snap.restore()
+            snap.pop()
+            snap.pop()
+
+
+# ---------- the socket the hook relay talks to ----------
+class HookServer:
+    def __init__(self, on_event, on_gone):
+        self.on_event, self.on_gone = on_event, on_gone
+        self.live = set()
+        try:
+            SOCK.unlink()
+        except FileNotFoundError:
+            pass
+        self.svc = Gio.SocketService.new()
+        self.svc.add_address(Gio.UnixSocketAddress.new(str(SOCK)), Gio.SocketType.STREAM,
+                             Gio.SocketProtocol.DEFAULT, None)
+        os.chmod(SOCK, 0o600)
+        self.svc.connect("incoming", self.incoming)
+        self.svc.start()
+
+    def incoming(self, _svc, conn, _source):
+        stream = Gio.DataInputStream.new(conn.get_input_stream())
+        self.live.add((conn, stream))
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.first_line, conn)
+        return True
+
+    def first_line(self, stream, result, conn):
+        try:
+            line, _n = stream.read_line_finish_utf8(result)
+            ev = json.loads(line) if line else None
+        except (GLib.Error, ValueError):
+            ev = None
+        if isinstance(ev, dict) and self.on_event(ev, conn):
+            # the relay is waiting for our answer; end-of-stream means Claude Code gave up on it
+            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self.watch, conn)
+        else:
+            self.close(conn)
+
+    def watch(self, stream, result, conn):
+        try:
+            stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            pass
+        self.close(conn)
+        self.on_gone(conn)
+
+    def reply(self, conn, text):
+        try:
+            if text:
+                conn.get_output_stream().write_all((text + "\n").encode(), None)
+        except GLib.Error:
+            pass
+        self.close(conn)
+
+    def close(self, conn):
+        for item in [i for i in self.live if i[0] is conn]:
+            self.live.discard(item)
+        try:
+            conn.close(None)
+        except GLib.Error:
+            pass
+
+
+class Session:
+    def __init__(self, sid, cwd):
+        self.id = sid
+        self.name = os.path.basename(cwd.rstrip("/")) or cwd or "Claude Code"
+        self.status = "idle"
+        self.last = "Started"
+        self.reply = ""            # Claude's final reply, from the Stop hook
+        self.updated = time.time()
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def first_line(text, limit=110):
+    """The first readable line of some Markdown, for a one-line summary."""
+    for line in text.splitlines():
+        line = re.sub(r"[`*_#>]+", "", line).strip(" -•\t")
+        if line:
+            return line if len(line) <= limit else line[:limit - 1] + "…"
+    return ""
+
+
+class Activity:
+    """Something going on that GUY shows: a download, a pacman run, anything a script reports."""
+
+    def __init__(self, key, kind, title, icon):
+        self.key, self.kind, self.title, self.icon = key, kind, title, icon
+        self.detail = ""
+        self.progress = None
+        self.state = "running"     # running, done, error
+        self.open = None           # path or URL opened on click
+        self.updated = time.time()
+
+
+PARTIAL_SUFFIXES = (".crdownload", ".part")
+
+
+class DownloadWatcher:
+    """Browser downloads: Chrome writes name.crdownload (at first "Unconfirmed 123.crdownload"), Firefox
+    name.part; both rename it to the final name when done and delete it when cancelled. Costs nothing
+    until a download starts; then it checks sizes once a second for the speed."""
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or str(HOME / "Downloads")
+        self.tracked = {}          # partial path -> [activity, last size, last time]
+        self.poll_id = None
+        self.mon = None
+        if not os.path.isdir(self.dir):
+            return
+        self.mon = Gio.File.new_for_path(self.dir).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self.mon.connect("changed", self.changed)
+        for name in os.listdir(self.dir):
+            path = os.path.join(self.dir, name)
+            try:
+                if self.partial(path) and time.time() - os.path.getmtime(path) < 60:
+                    self.track(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def partial(path):
+        return path.endswith(PARTIAL_SUFFIXES)
+
+    @staticmethod
+    def final_name(path):
+        name = os.path.basename(path)
+        for suffix in PARTIAL_SUFFIXES:
+            name = name.removesuffix(suffix)
+        return name
+
+    def title(self, path):
+        name = self.final_name(path)
+        return "Starting a download…" if name.startswith("Unconfirmed ") else name
+
+    def track(self, path):
+        if path in self.tracked:
+            return
+        act = self.guy.set_activity("dl:" + path, "download", self.title(path), "folder-download-symbolic",
+                                    detail="Downloading…", open=self.dir)
+        act.state = "running"
+        self.tracked[path] = [act, 0, time.monotonic()]
+        if self.poll_id is None:
+            self.poll_id = GLib.timeout_add(1000, self.poll)
+        self.guy.apply()
+
+    def changed(self, _mon, file, other, event):
+        E = Gio.FileMonitorEvent
+        path = file.get_path() if file else None
+        if not path:
+            return
+        if event in (E.CREATED, E.MOVED_IN, E.CHANGED) and self.partial(path):
+            self.track(path)
+        elif event == E.RENAMED and other is not None:
+            new = other.get_path()
+            if path in self.tracked:
+                if self.partial(new):          # Chrome naming "Unconfirmed 123.crdownload" properly
+                    entry = self.tracked.pop(path)
+                    self.tracked[new] = entry
+                    entry[0].title = self.title(new)
+                else:
+                    self.finished(path, new)
+            elif self.partial(new):
+                self.track(new)
+        elif event in (E.DELETED, E.MOVED_OUT) and path in self.tracked:
+            final = os.path.join(self.dir, self.final_name(path))
+            try:
+                done = os.path.getsize(final) > 0
+            except OSError:
+                done = False
+            if done:
+                self.finished(path, final)
+            else:                              # cancelled
+                act = self.tracked.pop(path)[0]
+                self.guy.remove_activity(act.key)
+
+    def finished(self, old, new):
+        act = self.tracked.pop(old)[0]
+        try:
+            size = human_size(os.path.getsize(new))
+        except OSError:
+            size = ""
+        act.state, act.progress, act.open = "done", None, new
+        act.title = os.path.basename(new)
+        act.detail = "Downloaded" + (f"  ·  {size}" if size else "") + "  ·  click to open"
+        act.updated = time.time()
+        self.guy.flash(f"Downloaded {act.title}", "done", 5.0)
+
+    def poll(self):
+        now = time.monotonic()
+        for path, entry in list(self.tracked.items()):
+            act, last, then = entry
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            speed = max(0.0, (size - last) / max(now - then, 0.001)) if last else 0.0
+            entry[1], entry[2] = size, now
+            act.detail = human_size(size) + (f"  ·  {human_size(speed)}/s" if speed else "")
+            act.updated = time.time()
+        if not self.tracked:
+            self.poll_id = None
+            return False
+        self.guy.apply()
+        return True
+
+
+class PacmanWatcher:
+    """pacman, and so yay, as it runs: follows /var/log/pacman.log line by line."""
+
+    LOG = "/var/log/pacman.log"
+    LINE = re.compile(r"^\[[^\]]+\] \[(\w+)\] (.*)$")
+    CHANGE = re.compile(r"^(upgraded|installed|removed|downgraded|reinstalled) (\S+)")
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.act = None
+        self.count = 0
+        self.full = False
+        self.mon = None
+        self.last_line = 0.0       # monotonic time of the last log line, for the prompt watcher
+        try:
+            self.offset = os.path.getsize(self.LOG)
+        except OSError:
+            return
+        self.mon = Gio.File.new_for_path(self.LOG).monitor_file(Gio.FileMonitorFlags.NONE, None)
+        self.mon.connect("changed", self.changed)
+
+    def changed(self, *_):
+        try:
+            with open(self.LOG, "rb") as f:
+                if os.fstat(f.fileno()).st_size < self.offset:    # rotated
+                    self.offset = 0
+                f.seek(self.offset)
+                data = f.read()
+        except OSError:
+            return
+        end = data.rfind(b"\n")
+        if end < 0:
+            return
+        self.offset += end + 1
+        self.last_line = time.monotonic()
+        for line in data[:end].decode(errors="replace").splitlines():
+            self.line(line)
+        self.guy.apply()
+
+    def running(self):
+        return (self.act is not None and self.act.state == "running"
+                and self.guy.activities.get("pacman") is self.act)   # not pruned while quiet
+
+    def start(self, detail, pop=False):
+        if not self.running():
+            self.count, self.full = 0, False
+            self.act = self.guy.set_activity("pacman", "update", "Packages", "system-software-update-symbolic")
+            self.act.state, self.act.open = "running", None
+            pop = True
+        self.act.detail = detail
+        self.act.updated = time.time()
+        what = "Updating the system" if self.full else "Installing packages"
+        self.act.title = what + (f"  ·  {self.count}" if self.count else "")
+        if pop:
+            self.guy.pop(self.act, 4.0)
+
+    def finish(self, ok):
+        if not self.running():
+            return
+        n = self.count
+        noun = "package" if n == 1 else "packages"
+        if ok:
+            self.act.title = (f"System updated  ·  {n} {noun}" if self.full else f"{n} {noun} changed")
+            self.act.detail = "Done"
+        else:
+            self.act.title, self.act.detail = "Package update failed", "See the terminal"
+        self.act.state = "done" if ok else "error"
+        self.act.updated = time.time()
+        self.guy.pop(self.act, 6.0)
+        GLib.timeout_add_seconds(5, self.guy.check_updates)
+
+    def line(self, line):
+        m = self.LINE.match(line)
+        if not m:
+            return
+        source, msg = m.groups()
+        if msg == "synchronizing package lists":
+            self.start("Syncing package databases…")
+        elif msg == "starting full system upgrade":
+            self.start("Downloading packages…")
+            self.full = True
+            self.start("Downloading packages…")
+        elif source == "ALPM" and msg == "transaction started":
+            self.start("Installing…", pop=True)
+        elif source == "ALPM" and (c := self.CHANGE.match(msg)):
+            self.count += 1
+            self.start(f"{c.group(1).capitalize()} {c.group(2)}")
+        elif source == "ALPM" and msg.startswith("running '") and self.running():
+            self.act.detail = "Running hooks…"
+        elif source == "ALPM" and msg == "transaction completed":
+            self.finish(True)
+        elif source == "ALPM" and re.match(r"transaction (failed|interrupted)", msg):
+            self.finish(False)
+
+
+class MediaWatcher:
+    """Whatever is playing (Spotify, a browser tab, mpv…), from MPRIS via `playerctl --follow`, which
+    blocks until something changes, so it costs nothing while nothing does."""
+
+    FORMAT = "{{playerName}}\t{{status}}\t{{artist}}\t{{title}}"
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.now = None            # {"player", "status", "artist", "title"}
+        self.announce = 0.0        # until then, show the next track change even when paused (after "next")
+        if not shutil.which("playerctl"):
+            return
+        try:
+            self.proc = subprocess.Popen(["playerctl", "--follow", "metadata", "--format", self.FORMAT],
+                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                         start_new_session=True)
+        except OSError:
+            return
+        threading.Thread(target=self.read, daemon=True).start()
+
+    def read(self):
+        for line in self.proc.stdout:
+            GLib.idle_add(self.changed, line.rstrip("\n"))
+
+    def changed(self, line):
+        fields = line.split("\t")
+        if len(fields) < 4 or not fields[3]:
+            self.now = None
+            self.guy.remove_activity("media")
+            return False
+        before = self.now
+        self.now = dict(zip(("player", "status", "artist", "title"), fields[:4]))
+        playing = self.now["status"] == "Playing"
+        act = self.guy.set_activity("media", "media", self.now["title"],
+                                    "media-playback-start-symbolic" if playing else "media-playback-pause-symbolic",
+                                    detail=self.now["artist"] or self.now["player"])
+        act.state = "idle"         # shown in the list and popped on changes, never keeps the pill out
+        new_track = before is None or before["title"] != self.now["title"]
+        asked = new_track and time.monotonic() < self.announce
+        if asked or (playing and (new_track or before["status"] != "Playing")):
+            self.announce = 0.0
+            self.guy.pop(act, 4.0)
+        else:
+            self.guy.apply()
+        return False
+
+
+PKG_TOOLS = ("yay", "paru", "pacman", "pamac", "makepkg")
+
+
+def scan_procs():
+    """pid -> (comm, state, ppid, pgrp, tty_nr, tpgid, cpu ticks), from the world-readable /proc/*/stat."""
+    procs = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat", "rb") as f:
+                raw = f.read().decode(errors="replace")
+        except OSError:
+            continue
+        r = raw.rfind(")")
+        f = raw[r + 2:].split()
+        procs[int(d)] = (raw[raw.find("(") + 1:r], f[0], int(f[1]), int(f[2]), int(f[4]), int(f[5]),
+                         int(f[11]) + int(f[12]))
+    return procs
+
+
+def pts_path(tty_nr):
+    major, minor = (tty_nr >> 8) & 0xFFF, (tty_nr & 0xFF) | ((tty_nr >> 12) & 0xFFF00)
+    return f"/dev/pts/{minor + (major - 136) * 256}" if 136 <= major <= 143 else None
+
+
+def echo_off(tty_nr):
+    """True when the terminal has echo off but line input on: someone is being asked for a password.
+    Only reads the terminal's settings, never what's typed; root-owned ptys (sudo use_pty) are skipped."""
+    path = pts_path(tty_nr)
+    if not path:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        lflag = termios.tcgetattr(fd)[3]
+    except termios.error:
+        return False
+    finally:
+        os.close(fd)
+    return not (lflag & termios.ECHO) and bool(lflag & termios.ICANON)
+
+
+class PromptWatcher:
+    """Notices yay / pacman / sudo sitting at a terminal waiting for you. A password prompt turns the
+    terminal's echo off; a question ([Y/n], a provider number, yay's menus) leaves the package tool in
+    the terminal's foreground, asleep, using no CPU at all for a few seconds. Checks /proc every 1.5 s,
+    which costs a couple of milliseconds; it does nothing else until a package tool is running."""
+
+    IDLE_POLLS = 3
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.last = None           # (tty, fg group, cpu) seen on the previous poll
+        self.idle = 0
+        GLib.timeout_add(1500, self.poll)
+
+    def cmdline(self, pid):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            return ""
+
+    def chain(self, pid, procs):
+        seen = []
+        while pid in procs and pid > 1 and len(seen) < 64:
+            seen.append(pid)
+            pid = procs[pid][2]
+        return seen
+
+    def is_tool(self, pid, p, procs):
+        if p[0] in PKG_TOOLS:
+            return True
+        if p[0] == "sudo":
+            return "pacman" in self.cmdline(pid) or any(procs[a][0] in PKG_TOOLS for a in self.chain(pid, procs)[1:])
+        return False
+
+    def outermost(self, pid, procs):
+        names = [procs[a][0] for a in self.chain(pid, procs) if procs[a][0] in PKG_TOOLS]
+        return names[-1] if names else "sudo"
+
+    def poll(self):
+        procs = scan_procs()
+        tools = [pid for pid, p in procs.items() if self.is_tool(pid, p, procs)]
+        found = None
+        ttys = {}
+        for pid in tools:
+            p = procs[pid]
+            if p[4] > 0 and p[5] > 0:
+                ttys.setdefault(p[4], (pid, p[5]))
+        for tty, (tool_pid, fg) in ttys.items():
+            members = [(pid, q) for pid, q in procs.items() if q[3] == fg]
+            if not members:
+                continue
+            asleep = all(q[1] == "S" for _pid, q in members)
+            cpu = sum(q[6] for _pid, q in members)
+            leader = procs.get(fg, members[0][1])[0]
+            who = self.outermost(tool_pid, procs)
+            if asleep and echo_off(tty):
+                found = {"kind": "password", "pid": tool_pid,
+                         "text": f"{who} needs your password" if leader == "sudo" else f"{leader} needs a password"}
+                break
+            key = (tty, fg, cpu)
+            self.idle = self.idle + 1 if (asleep and key == self.last) else 0
+            self.last = key
+            quiet = time.monotonic() - self.guy.pacman.last_line > 3
+            if self.idle >= self.IDLE_POLLS and quiet and (leader in PKG_TOOLS or leader == "sudo"):
+                found = {"kind": "answer", "pid": tool_pid, "text": f"{who} is waiting for your answer"}
+                break
+        if not ttys:
+            self.last, self.idle = None, 0
+        self.guy.set_prompt(found)
+        return True
+
+
+class Approval:
+    def __init__(self, conn, ev, session):
+        self.conn, self.ev, self.session = conn, ev, session
+        self.tool = ev.get("tool_name") or "a tool"
+        self.input = ev.get("tool_input") or {}
+        self.agent = bool(ev.get("guy_agent"))     # GUY's own assistant, not a Claude Code session
+        self.risk = ev.get("risk") or ""
+
+
+# ---------- the app ----------
+class Guy:
+    def __init__(self, app):
+        self.app = app
+        self.mode = "hidden"
+        self.user_mode = None      # "home" or "ask" when the user opened one
+        self.hover = False
+        self.dragging = False
+        self.pointer = None
+        self.flash_until, self.flash_text, self.flash_mood = 0.0, "", "idle"
+        self.linger_until = 0.0    # after Ask closes, the pill it shrank into stays this long
+        self.flash_act = None      # an activity the pill is popped out for, shown live
+        self.prompt = None         # a terminal waiting for you: {"kind", "pid", "text"}
+        self.voice_state = None    # "listening" / "thinking" while you talk to GUY
+        self.voice_words = ""      # what you've said so far, live
+        self.voice_wake = None     # "Hey GUY" on/off, as guy-voice reports it (None: not running)
+        self.voice_gen = -1        # the Claude answer to read aloud
+        self.agent_session = None  # the Claude session behind the open Ask conversation, resumed for follow-ups
+        self.convo_until = 0.0     # until then a voice follow-up continues the last conversation
+        self.agent_status = ""     # what GUY's assistant is doing, shown on the pill when the panel is closed
+        self.schedule = load_schedule()
+        self.pending = None
+        self.tick = None
+        self.last_t = None
+        self.leave_timer = None
+        self.sessions = {}
+        self.approvals = []
+        self.activities = {}
+        self.updates = None        # (count, "pacman 10  ·  yay 2") from HyDE's checker
+        self.faces = []
+        # Ask GUY
+        self.items, self.view, self.mode_list = [], "idle", "search"
+        self.claude_proc, self.claude_gen, self.answer_text = None, 0, ""
+        self.file_gen = 0
+        self.history, self.attachment, self.last_query = [], None, ""
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+
+        win = Gtk.ApplicationWindow(application=app)
+        win.remove_css_class("background")
+        win.add_css_class("guy")
+        win.set_default_size(SURF_W, SURF_H)
+        LayerShell.init_for_window(win)
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_namespace(win, "guy")
+        LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+        LayerShell.set_exclusive_zone(win, -1)
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+        self.win = win
+
+        self.stack = Gtk.Stack(hhomogeneous=False, vhomogeneous=False, interpolate_size=False)
+        self.stack.add_css_class("page")
+        self.stack.add_named(self.build_peek(), "peek")
+        self.stack.add_named(self.build_home(), "home")
+        self.stack.add_named(self.build_approval(), "approval")
+        self.stack.add_named(self.build_ask(), "ask")
+        self.stack.add_named(self.build_drop(), "drop")
+        self.stack.set_visible(False)
+        self.island = Island(self.stack)
+        self.island.on_target = self.kick
+        win.set_child(self.island)
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", self.on_enter)
+        motion.connect("motion", lambda _c, x, y: self.on_motion(x, y))
+        motion.connect("leave", self.on_leave)
+        win.add_controller(motion)
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        win.add_controller(keys)
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("enter", self.on_drag_enter)
+        drop.connect("leave", self.on_drag_leave)
+        drop.connect("drop", self.on_drop)
+        win.add_controller(drop)
+
+        # while Ask GUY is open, a click anywhere else on screen closes it
+        catcher = Gtk.Window(application=app)
+        catcher.remove_css_class("background")
+        catcher.add_css_class("guy-catcher")
+        LayerShell.init_for_window(catcher)
+        LayerShell.set_layer(catcher, LayerShell.Layer.TOP)
+        LayerShell.set_namespace(catcher, "guy-catcher")
+        for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+            LayerShell.set_anchor(catcher, edge, True)
+        LayerShell.set_exclusive_zone(catcher, -1)
+        LayerShell.set_keyboard_mode(catcher, LayerShell.KeyboardMode.NONE)
+        click = Gtk.GestureClick(button=0)
+        click.connect("pressed", lambda *_: self.close_ask())
+        catcher.add_controller(click)
+        self.catcher = catcher
+
+        try:
+            self.server = HookServer(self.on_hook, self.on_hook_gone)
+        except GLib.Error as e:
+            print(f"guy: can't listen on {SOCK}: {e.message}", file=sys.stderr)
+            self.server = None
+
+        self.downloads = DownloadWatcher(self)
+        self.pacman = PacmanWatcher(self)
+        self.prompts = PromptWatcher(self)
+        self.media = MediaWatcher(self)
+        GLib.timeout_add(1500, lambda: self.voice_send(status=True) and False)
+        GLib.timeout_add_seconds(20, self.check_schedule)
+        GLib.timeout_add_seconds(3, lambda: self.check_schedule() and False)
+        GUY_DATA.mkdir(parents=True, exist_ok=True)
+        self.timer_tick = None
+        GLib.timeout_add_seconds(20, lambda: self.check_updates() and False)
+        GLib.timeout_add_seconds(1800, self.check_updates)
+
+        win.present()
+        GLib.idle_add(self.update_input_region)
+        GLib.timeout_add_seconds(60, self.prune)
+        self.flash("Hi, I'm GUY  ·  Alt+Space to ask me", "done", 3.0)
+
+    # ----- pages -----
+    def face(self, size):
+        f = Face(size, self)
+        self.faces.append(f)
+        return f
+
+    def build_peek(self):
+        box = Gtk.Box(spacing=10)
+        box.add_css_class("peek")
+        box.append(self.face(26))
+        self.peek_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=48)
+        self.peek_label.add_css_class("peek-label")
+        box.append(self.peek_label)
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: self.focus_prompt() if self.prompt else self.open_home())
+        box.add_controller(click)
+        return box
+
+    def build_home(self):
+        box = Gtk.Box(spacing=20)
+        box.add_css_class("home")
+        box.append(self.face(92))
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, hexpand=True)
+        head = Gtk.Box(spacing=8)
+        title = Gtk.Label(label="GUY", xalign=0)
+        title.add_css_class("head")
+        head.append(title)
+        sub = Gtk.Label(label="Glanceable Utility Yokai", xalign=0, hexpand=True)
+        sub.add_css_class("dim")
+        head.append(sub)
+        self.mic_button = Gtk.Button()
+        self.mic_button.add_css_class("action")
+        self.mic_button.set_tooltip_text("Listen for \"Hey GUY\" (Super+Space works either way)")
+        self.mic_button.connect("clicked", lambda *_: self.voice_send(wake="toggle"))
+        head.append(self.mic_button)
+        ask = Gtk.Button(label="Ask GUY  ⌥␣")
+        ask.add_css_class("action")
+        ask.connect("clicked", lambda *_: self.open_ask())
+        head.append(ask)
+        col.append(head)
+        self.session_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        col.append(self.session_box)
+        box.append(col)
+        return box
+
+    def build_approval(self):
+        box = Gtk.Box(spacing=20)
+        box.add_css_class("approval")
+        box.append(self.face(80))
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9, hexpand=True)
+        self.ap_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.ap_title.add_css_class("head")
+        col.append(self.ap_title)
+        self.ap_detail = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=6,
+                                   ellipsize=Pango.EllipsizeMode.END, max_width_chars=70)
+        self.ap_detail.add_css_class("code")
+        col.append(self.ap_detail)
+        row = Gtk.Box(spacing=8)
+        self.ap_more = Gtk.Label(xalign=0, hexpand=True)
+        self.ap_more.add_css_class("dim")
+        row.append(self.ap_more)
+        for label, decision, css in (("Ask in terminal", None, "ghost"), ("Deny", "deny", None),
+                                     ("Allow", "allow", "primary")):
+            b = Gtk.Button(label=label)
+            b.add_css_class("action")
+            if css:
+                b.add_css_class(css)
+            b.connect("clicked", lambda _b, d=decision: self.decide(d))
+            row.append(b)
+        col.append(row)
+        box.append(col)
+        return box
+
+    def build_drop(self):
+        box = Gtk.Box(spacing=18)
+        box.add_css_class("drop")
+        box.append(self.face(64))
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER)
+        t = Gtk.Label(label="Drop it on GUY", xalign=0)
+        t.add_css_class("head")
+        col.append(t)
+        d = Gtk.Label(label="I'll read it, then ask me anything about it.", xalign=0)
+        d.add_css_class("dim")
+        col.append(d)
+        box.append(col)
+        return box
+
+    def build_ask(self):
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        row = Gtk.Box(spacing=12)
+        row.add_css_class("search-row")
+        self.ask_face = self.face(34)
+        row.append(self.ask_face)
+        self.chip = Gtk.Box(spacing=2, valign=Gtk.Align.CENTER)
+        self.chip.add_css_class("chip")
+        self.chip_label = Gtk.Label(ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=22)
+        self.chip.append(self.chip_label)
+        x = Gtk.Button(label="×")
+        x.connect("clicked", lambda *_: self.set_attachment(None))
+        self.chip.append(x)
+        row.append(self.chip)
+        self.entry = Gtk.Entry(hexpand=True, placeholder_text="Ask GUY")
+        self.entry.add_css_class("search")
+        self.entry.connect("changed", self.on_changed)
+        row.append(self.entry)
+        panel.append(row)
+
+        self.sep = Gtk.Box()
+        self.sep.add_css_class("sep")
+        panel.append(self.sep)
+
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE, activate_on_single_click=True)
+        self.listbox.add_css_class("results")
+        self.listbox.connect("row-activated", lambda _lb, r: self.activate_index(r.get_index()))
+        self.list_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                              propagate_natural_height=True, max_content_height=420)
+        self.list_scroll.set_child(self.listbox)
+        panel.append(self.list_scroll)
+
+        self.answer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        head = Gtk.Box(spacing=8)
+        head.add_css_class("answer-head")
+        self.answer_title = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        head.append(self.answer_title)
+        self.spinner = Gtk.Spinner()
+        head.append(self.spinner)
+        self.answer_box.append(head)
+        self.answer_label = Gtk.Label(xalign=0, yalign=0, wrap=True, selectable=True,
+                                      wrap_mode=Pango.WrapMode.WORD_CHAR)
+        self.answer_label.add_css_class("answer")
+        self.answer_label.set_focusable(False)
+        answer_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                           propagate_natural_height=True, max_content_height=420)
+        answer_scroll.set_child(self.answer_label)
+        self.answer_box.append(answer_scroll)
+        panel.append(self.answer_box)
+
+        # GUY's assistant wants to do something risky: asked right here, above the footer
+        self.ask_ap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.ask_ap.add_css_class("approval")
+        self.ask_ap_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.ask_ap_title.add_css_class("head")
+        self.ask_ap.append(self.ask_ap_title)
+        self.ask_ap_detail = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, lines=4,
+                                       ellipsize=Pango.EllipsizeMode.END, max_width_chars=70)
+        self.ask_ap_detail.add_css_class("code")
+        self.ask_ap.append(self.ask_ap_detail)
+        row = Gtk.Box(spacing=8)
+        hint = Gtk.Label(label="Ctrl+Y allow  ·  Ctrl+N deny  ·  or say yes / no", xalign=0, hexpand=True)
+        hint.add_css_class("dim")
+        row.append(hint)
+        for label, decision, css in (("Deny", "deny", None), ("Allow", "allow", "primary")):
+            b = Gtk.Button(label=label)
+            b.add_css_class("action")
+            if css:
+                b.add_css_class(css)
+            b.connect("clicked", lambda _b, d=decision: self.decide(d, self.agent_approval()))
+            row.append(b)
+        self.ask_ap.append(row)
+        self.ask_ap.set_visible(False)
+        panel.append(self.ask_ap)
+
+        self.ask_voice = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.START)
+        self.ask_voice.add_css_class("answer-head")
+        self.ask_voice.set_visible(False)
+        panel.append(self.ask_voice)
+
+        self.footer = Gtk.Label(xalign=0, label=HINT_IDLE, ellipsize=Pango.EllipsizeMode.END)
+        self.footer.add_css_class("footer")
+        panel.append(self.footer)
+        self.set_attachment(None)
+        self.set_view("idle")
+        return panel
+
+    # ----- what the island shows -----
+    def active(self):
+        # package runs don't keep the pill out; they pop it out at each step (see pop)
+        return (self.prompt is not None or self.voice_state is not None
+                or (self.claude_proc is not None and self.user_mode != "ask")
+                or any(s.status == "waiting" for s in self.sessions.values())
+                or any(a.state == "running" and a.kind != "update" for a in self.activities.values()))
+
+    def compute_mode(self):
+        if self.user_mode == "ask":
+            return "ask"
+        if self.dragging:
+            return "drop"
+        if self.approvals:
+            return "approval"
+        if self.user_mode == "home":
+            return "home"
+        now = time.monotonic()
+        if self.hover or self.active() or now < self.flash_until or now < self.linger_until:
+            return "peek"
+        return "hidden"
+
+    def mood(self):
+        if self.voice_state == "listening":
+            return "listening"
+        if self.voice_state == "thinking":
+            return "working"
+        if self.approvals or self.prompt or any(x.status == "waiting" for x in self.sessions.values()):
+            return "waiting"
+        if time.monotonic() < self.flash_until:
+            return self.flash_mood
+        if any(a.state == "running" for a in self.activities.values()):
+            return "working"
+        return "idle"
+
+    def apply(self):
+        self.refresh_pages()
+        mode = self.compute_mode()
+        isl = self.island
+        if mode != self.mode:
+            prev, self.mode = self.mode, mode
+            if prev == "ask":
+                self.leave_ask()
+            if mode == "ask":
+                self.enter_ask()
+            if mode == "hidden":
+                # keep the width and pull the glass straight up into the top edge
+                self.pending = None
+                isl.follow = False
+                isl.tw, isl.th = isl.w, 0.0
+                isl.vw = 0.0
+            else:
+                self.pending = mode
+                isl.follow = False
+                page = self.stack.get_child_by_name(mode)
+                isl.tw = float(self.page_width(mode))
+                isl.th = float(isl.page_height(page, isl.tw))
+                if isl.h < 1:
+                    # coming out of the edge: drop straight down at the final width
+                    isl.w, isl.vw = isl.tw, 0.0
+        elif mode == "peek":
+            isl.tw = float(self.page_width("peek"))
+            isl.queue_allocate()
+        self.kick()
+        return False
+
+    def page_width(self, mode):
+        if mode == "peek":
+            nat = self.stack.get_child_by_name("peek").measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            return max(170, min(460, nat))
+        return WIDTHS[mode]
+
+    def refresh_pages(self):
+        mood = self.mood()
+        for f in self.faces:
+            f.mood = mood
+        if self.claude_proc is not None:
+            self.ask_face.mood = "working"
+        # peek
+        waiting = self.approvals[0].session.name if self.approvals else None
+        running = sorted((a for a in self.activities.values() if a.state == "running" and a.kind != "update"),
+                         key=lambda a: -a.updated)
+        if self.voice_state == "listening":
+            words = self.voice_words
+            text = f"“{words if len(words) <= 52 else '…' + words[-51:]}”" if words else "Listening…"
+        elif self.voice_state == "thinking":
+            words = self.voice_words
+            text = f"“{words if len(words) <= 40 else '…' + words[-39:]}”  ·  thinking…" if words else "Thinking…"
+        elif waiting:
+            text = f"{waiting} needs you"
+        elif self.claude_proc is not None and self.user_mode != "ask":
+            text = "GUY is " + (self.agent_status.rstrip("…") + "…" if self.agent_status else "working…")
+        elif self.prompt:
+            text = f"{self.prompt['text']}  ·  click to answer"
+        elif asking := [x for x in self.sessions.values() if x.status == "waiting"]:
+            text = f"{asking[0].name}  ·  {asking[0].last}"
+        elif time.monotonic() < self.flash_until:
+            a = self.flash_act
+            text = (a.title + (f"  ·  {a.detail}" if a.detail else "")) if a else self.flash_text
+        elif running:
+            text = running[0].title + (f"  ·  {running[0].detail}" if running[0].detail else "")
+        else:
+            text = "Ask GUY  ·  Alt+Space"
+        self.peek_label.set_label(text)
+        in_panel = self.user_mode == "ask" and self.voice_state is not None
+        self.ask_voice.set_visible(in_panel)
+        if in_panel:
+            words = self.voice_words
+            self.ask_voice.set_label(("🎙  Listening…" if self.voice_state == "listening" else "🎙  Thinking…")
+                                     + (f"   “{words}”" if words else ""))
+        self.mic_button.set_visible(self.voice_wake is not None)
+        self.mic_button.set_label("🎙  Hey GUY: on" if self.voice_wake else "🎙  Hey GUY: off")
+        # home
+        while (child := self.session_box.get_first_child()) is not None:
+            self.session_box.remove(child)
+        sessions = sorted(self.sessions.values(), key=lambda s: -s.updated)[:3]
+        acts = sorted(self.activities.values(), key=lambda a: (a.state != "running", -a.updated))[:3]
+        updates = self.updates if self.updates and self.updates[0] else None
+        if self.prompt:
+            icon = Gtk.Image.new_from_icon_name("dialog-password-symbolic" if self.prompt["kind"] == "password"
+                                                else "input-keyboard-symbolic")
+            icon.add_css_class("aicon")
+            self.add_row(icon, self.prompt["text"], "Click to go to the terminal", None, self.focus_prompt)
+        if not (sessions or acts or updates or self.prompt or self.schedule):
+            empty = Gtk.Label(xalign=0, wrap=True, max_width_chars=60,
+                              label="Nothing running. Drop a file on me, or press Alt+Space and ask me anything.")
+            empty.add_css_class("empty")
+            self.session_box.append(empty)
+        for s in sessions:
+            dot = Gtk.Box(valign=Gtk.Align.CENTER)
+            dot.add_css_class("dot")
+            dot.add_css_class(s.status)
+            click = (lambda s=s: self.show_reply(s)) if s.reply else None
+            self.add_row(dot, s.name, s.last, age(s.updated), click)
+        for a in acts:
+            icon = Gtk.Image.new_from_icon_name(a.icon)
+            icon.add_css_class("aicon")
+            click = (lambda a=a: self.open_activity(a)) if a.open else None
+            if getattr(a, "reply", None):
+                click = (lambda a=a: self.show_text(a.title, a.reply, f"What did the routine “{a.title}” report?"))
+            trailing, when = None, age(a.updated)
+            if a.kind == "media":
+                trailing, when = Gtk.Box(spacing=4), None
+                playing = self.media.now and self.media.now["status"] == "Playing"
+                for icon_name, action in (("media-skip-backward-symbolic", "previous"),
+                                          ("media-playback-pause-symbolic" if playing else "media-playback-start-symbolic",
+                                           "play-pause"),
+                                          ("media-skip-forward-symbolic", "next")):
+                    b = Gtk.Button(icon_name=icon_name)
+                    b.add_css_class("action")
+                    b.add_css_class("small")
+                    b.connect("clicked", lambda _b, x=action: self.do_intent(x, None, quiet=True))
+                    trailing.append(b)
+            elif a.kind == "timer" and a.state == "running":
+                trailing, when = Gtk.Button(label="Cancel"), None
+                trailing.add_css_class("action")
+                trailing.add_css_class("small")
+                trailing.connect("clicked", lambda _b, k=a.key: self.remove_activity(k))
+            self.add_row(icon, a.title, a.detail, when, click, a.progress, trailing)
+        for item in sorted(self.schedule, key=lambda i: i.get("at", ""))[:2]:
+            icon = Gtk.Image.new_from_icon_name("alarm-symbolic" if item.get("kind") == "remind" else "view-calendar-symbolic")
+            icon.add_css_class("aicon")
+            cancel = Gtk.Button(label="Cancel")
+            cancel.add_css_class("action")
+            cancel.add_css_class("small")
+            cancel.connect("clicked", lambda _b, i=item.get("id"): self.unschedule(i))
+            when = item.get("at", "").replace("T", " ")[5:16]
+            self.add_row(icon, item.get("text", ""), when + (f"  ·  every {item['every']}" if item.get("every") else ""),
+                         None, None, None, cancel)
+        if updates:
+            icon = Gtk.Image.new_from_icon_name("system-software-update-symbolic")
+            icon.add_css_class("aicon")
+            button = Gtk.Button(label="Update")
+            button.add_css_class("action")
+            button.add_css_class("small")
+            button.connect("clicked", lambda *_: self.run_update())
+            noun = "update" if updates[0] == 1 else "updates"
+            self.add_row(icon, f"{updates[0]} {noun} available", updates[1], None, None, None, button)
+        # approval (on the island, or in the Ask panel when that's open and it's GUY's own assistant asking)
+        agent = self.agent_approval()
+        self.ask_ap.set_visible(agent is not None and self.user_mode == "ask")
+        if agent is not None:
+            self.ask_ap_title.set_label(f"GUY wants to {agent.risk}")
+            self.ask_ap_detail.set_label(tool_detail(agent.tool, agent.input))
+        if self.approvals:
+            a = self.approvals[0]
+            verb = {"Bash": "run a command", "Edit": "edit a file", "MultiEdit": "edit a file",
+                    "Write": "write a file", "WebFetch": "fetch a page"}.get(a.tool, f"use {a.tool}")
+            if a.agent:
+                verb = a.risk
+            self.ap_title.set_label(f"{a.session.name} wants to {verb}")
+            self.ap_detail.set_label(tool_detail(a.tool, a.input))
+            more = len(self.approvals) - 1
+            self.ap_more.set_label(f"{more} more waiting" if more else "")
+
+    def add_row(self, lead, title, detail, when, click=None, progress=None, trailing=None):
+        row = Gtk.Box(spacing=10)
+        row.add_css_class("session")
+        row.append(lead)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True, valign=Gtk.Align.CENTER)
+        line = Gtk.Box(spacing=10)
+        name = Gtk.Label(label=title, xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=34)
+        name.add_css_class("sname")
+        line.append(name)
+        last = Gtk.Label(label=detail, xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        last.add_css_class("slast")
+        line.append(last)
+        text.append(line)
+        if progress is not None:
+            bar = Gtk.ProgressBar(fraction=max(0.0, min(1.0, progress)))
+            text.append(bar)
+        row.append(text)
+        if when:
+            label = Gtk.Label(label=when)
+            label.add_css_class("sage")
+            row.append(label)
+        if trailing:
+            row.append(trailing)
+        if click:
+            row.add_css_class("clickable")
+            gesture = Gtk.GestureClick()
+            gesture.connect("released", lambda *_: click())
+            row.add_controller(gesture)
+        self.session_box.append(row)
+
+    # ----- activities -----
+    def set_activity(self, key, kind, title, icon, detail=None, open=None):
+        act = self.activities.get(key)
+        if act is None:
+            act = self.activities[key] = Activity(key, kind, title, icon)
+        act.title, act.icon = title, icon
+        if detail is not None:
+            act.detail = detail
+        if open is not None:
+            act.open = open
+        act.updated = time.time()
+        return act
+
+    def remove_activity(self, key):
+        if self.activities.pop(key, None) is not None:
+            self.apply()
+
+    def on_activity_command(self, c):
+        key = "cmd:" + str(c.get("key"))
+        if c.get("clear"):
+            self.remove_activity(key)
+            return
+        act = self.set_activity(key, "custom", c.get("title") or str(c.get("key")),
+                                c.get("icon") or "emblem-synchronizing-symbolic",
+                                detail=c.get("detail") or "", open=c.get("open"))
+        act.progress = c.get("progress")
+        if c.get("done") or c.get("error"):
+            act.state, act.progress = ("error" if c.get("error") else "done"), None
+            self.flash(act.title + (f"  ·  {act.detail}" if act.detail else ""), act.state, 5.0)
+        else:
+            act.state = "running"
+            self.apply()
+
+    def open_activity(self, act):
+        spawn("xdg-open", act.open)
+        self.user_mode = None
+        self.hover = False
+        self.apply()
+
+    def check_updates(self):
+        """Count available updates with HyDE's checker (the bar's updates module), off the main thread."""
+        def work():
+            result = None
+            try:
+                out = subprocess.run(["hyde-shell", "system.update"], capture_output=True, text=True,
+                                     timeout=180).stdout.strip().splitlines()
+                lines = json.loads(out[-1]).get("tooltip", "").splitlines() if out else []
+                if lines and (m := re.search(r"(\d+)", lines[0])):
+                    parts = [ln.replace(": ", " ") for ln in lines[1:] if ln.strip() and not ln.endswith(": 0")]
+                    result = (int(m.group(1)), "  ·  ".join(parts))
+            except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+                pass
+            GLib.idle_add(self.got_updates, result)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def got_updates(self, result):
+        before = self.updates[0] if self.updates else 0
+        self.updates = result
+        if result and result[0] > before:
+            noun = "update" if result[0] == 1 else "updates"
+            self.flash(f"{result[0]} {noun} available  ·  click to see", "idle", 5.0)
+        else:
+            self.apply()
+        return False
+
+    def run_update(self):
+        """yay -Syu in a new kitty window, left open afterwards so you can read what happened.
+        The prompt watcher still calls you back to it for the sudo password and any [Y/n]."""
+        if shutil.which("kitty") and shutil.which("yay"):
+            spawn("kitty", "--title", "yay -Syu", "--hold", "yay", "-Syu")
+        else:
+            spawn("hyde-shell", "system.update", "up")
+        self.user_mode = None
+        self.hover = False
+        self.apply()
+
+    def do_intent(self, action, arg, quiet=False):
+        """Carry out a plain-language command, and say what happened on the pill."""
+        say = None
+        if action in ("volume-down", "volume-up", "volume-set", "mute", "unmute"):
+            if action == "volume-set":
+                run("wpctl", "set-volume", SINK, f"{arg}%")
+            elif action == "volume-down":
+                run("wpctl", "set-volume", SINK, f"{arg}%-")
+            elif action == "volume-up":
+                run("wpctl", "set-volume", "-l", "1.0", SINK, f"{arg}%+")
+            if action in ("volume-set", "volume-up", "unmute"):
+                run("wpctl", "set-mute", SINK, "0")
+            elif action == "mute":
+                run("wpctl", "set-mute", SINK, "1")
+            vol, muted = get_volume()
+            say = "Couldn't change the volume" if vol is None else f"Volume {vol}%" + ("  ·  muted" if muted else "")
+        elif action in ("next", "previous", "pause", "play", "play-pause"):
+            if not run("playerctl", "-l"):
+                say = "Nothing is playing"
+            else:
+                run("playerctl", action)
+                if action in ("pause", "play"):
+                    say = "Paused" if action == "pause" else "Playing"
+                elif action in ("next", "previous"):
+                    # the new track pops the pill as soon as the player reports it, playing or not
+                    self.media.announce = time.monotonic() + 3
+                    say = "Next track" if action == "next" else "Previous track"
+        elif action == "whats-playing":
+            now = self.media.now
+            say = (f"♪ {now['title']}" + (f"  ·  {now['artist']}" if now["artist"] else "")) if now else "Nothing is playing"
+        elif action == "timer":
+            self.start_timer(*arg)
+            return f"Timer set for {fmt_duration(arg[0])}" + (f", {arg[1]}" if arg[1] else "")
+        elif action == "update-system":
+            self.run_update()
+            return "Opening a terminal to update your packages"
+        elif action == "open":
+            say = self.open_thing(arg)
+            if say is None:
+                self.flash(f"Couldn't find “{arg}”", "idle", 2.5)
+                return None
+        elif action == "dismiss":
+            self.close_ask(explicit=True)
+            return None
+        elif action == "timer-cancel":
+            timers = [k for k, a in self.activities.items() if a.kind == "timer" and a.state == "running"]
+            for k in timers:
+                del self.activities[k]
+            say = "Timer cancelled" if len(timers) == 1 else f"{len(timers)} timers cancelled" if timers else "No timers running"
+        if say and not quiet:
+            self.flash(say, "idle", 2.5)
+        else:
+            self.apply()
+        return say
+
+    def open_thing(self, name):
+        """Open an app (or switch to it if it's already open), a folder, or a website. None if nothing fits."""
+        q = re.sub(r"[^\w\s.+-]", "", name).strip()
+        if not q:
+            return None
+        apps = load_apps()
+        # a window is known by its class and by its app's name and description ("terminal" finds kitty)
+        by_class = {a["wmclass"]: a for a in apps if a["wmclass"]}
+        by_class.update({a["id"].removesuffix(".desktop").lower(): a for a in apps})
+
+        def window_score(w):
+            app = by_class.get(w["class"].lower())
+            return max(score(q, w["class"]), score(q, app["name"], app["extra"]) if app else 0)
+
+        windows = load_windows()
+        if windows:
+            w = max(windows, key=window_score)
+            if window_score(w) >= 35:            # already open: switch to it
+                spawn("hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{w["address"]}" }})')
+                app = by_class.get(w["class"].lower())
+                return f"Switching to {app['name'] if app else w['class']}"
+        if apps:
+            a = max(apps, key=lambda a: score(q, a["name"], a["extra"]))
+            if score(q, a["name"], a["extra"]) >= 35:
+                spawn("uwsm", "app", "--", a["id"])
+                return f"Opening {a['name']}"
+            # a misheard name: "this cord" is Discord, "spot a fly" is Spotify; compare them without spaces
+            squash = re.sub(r"\W", "", q.lower())
+
+            def near(name):
+                return difflib.SequenceMatcher(None, squash, re.sub(r"\W", "", name.lower())).ratio()
+            for w in windows:
+                app = by_class.get(w["class"].lower())
+                if max(near(w["class"]), near(app["name"]) if app else 0) >= 0.75:
+                    spawn("hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{w["address"]}" }})')
+                    return f"Switching to {app['name'] if app else w['class']}"
+            a = max(apps, key=lambda a: near(a["name"]))
+            if near(a["name"]) >= 0.75:
+                spawn("uwsm", "app", "--", a["id"])
+                return f"Opening {a['name']}"
+        key = re.sub(r"\s+(?:folder|directory)$", "", q.lower())
+        special = {"downloads": GLib.UserDirectory.DIRECTORY_DOWNLOAD, "documents": GLib.UserDirectory.DIRECTORY_DOCUMENTS,
+                   "pictures": GLib.UserDirectory.DIRECTORY_PICTURES, "photos": GLib.UserDirectory.DIRECTORY_PICTURES,
+                   "music": GLib.UserDirectory.DIRECTORY_MUSIC, "videos": GLib.UserDirectory.DIRECTORY_VIDEOS,
+                   "desktop": GLib.UserDirectory.DIRECTORY_DESKTOP}
+        folder = GLib.get_user_special_dir(special[key]) if key in special else str(HOME) if key in ("home", "home folder") else None
+        if folder is None:
+            for parent in (HOME, HOME / "Desktop"):
+                try:
+                    folder = next((str(c) for c in parent.iterdir() if c.is_dir() and c.name.lower() == key), None)
+                except OSError:
+                    folder = None
+                if folder:
+                    break
+        if folder:
+            spawn("xdg-open", folder)
+            return f"Opening {os.path.basename(folder.rstrip('/')) or 'your home folder'}"
+        if re.fullmatch(r"[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:/\S*)?", key):
+            spawn("xdg-open", "https://" + key)
+            return f"Opening {key}"
+        return None
+
+    def start_timer(self, secs, label):
+        key = f"timer:{time.monotonic()}"
+        act = self.set_activity(key, "timer", label.capitalize() if label else "Timer", "alarm-symbolic")
+        act.state = "running"
+        act.ends, act.total, act.label = time.monotonic() + secs, secs, label
+        self.tick_timers()
+        if self.timer_tick is None:
+            self.timer_tick = GLib.timeout_add(1000, self.tick_timers)
+        self.flash(f"Timer set for {fmt_duration(secs)}" + (f"  ·  {label}" if label else ""), "done", 2.5)
+
+    def tick_timers(self):
+        now = time.monotonic()
+        timers = [a for a in self.activities.values() if a.kind == "timer" and a.state == "running"]
+        for a in timers:
+            left = a.ends - now
+            a.detail = clock(left) + " left"
+            a.progress = 1 - left / a.total
+            if left <= 0:
+                a.state, a.progress, a.detail = "done", None, "Done"
+                a.updated = time.time()
+                what = a.label.capitalize() if a.label else "Timer"
+                self.chime()
+                GLib.timeout_add(700, lambda: self.chime() and False)
+                spawn("notify-send", "-a", "GUY", "-i", "alarm-symbolic", f"⏰ {what}",
+                      f"Your {fmt_duration(a.total)} timer is done")
+                self.flash(f"⏰ {what}  ·  time's up", "done", 10.0)
+        if not timers:
+            self.timer_tick = None
+            return False
+        self.apply()
+        return True
+
+    # ----- voice (guy-voice does the listening and speaking) -----
+    def voice_send(self, **msg):
+        try:
+            _send(msg, "guy-voice.sock")
+        except OSError:
+            pass
+        return False
+
+    def speak(self, text, follow=False):
+        """Say it; with follow, GUY keeps listening afterwards for your reply (no "Hey GUY" needed)."""
+        text = speakable(text or "")
+        if text:
+            self.voice_send(say=text, follow=follow)
+
+    def on_voice(self, ev):
+        event = ev.get("event")
+        if event == "wake":
+            before, self.voice_wake = self.voice_wake, bool(ev.get("on"))
+            if before is not None and before != self.voice_wake:
+                self.flash("Hey GUY is on" if self.voice_wake else "Hey GUY is off  ·  Super+Space still works",
+                           "idle", 2.5)
+            else:
+                self.apply()
+        elif event in ("listening", "thinking"):
+            if event == "listening":
+                self.voice_words = ""
+            self.voice_state = event
+            self.apply()
+        elif event == "partial":
+            self.voice_words = str(ev.get("text", ""))
+            self.apply()
+        elif event == "done":                    # a follow-up nobody used, or the conversation ended
+            self.voice_state = None
+            self.apply()
+        elif event == "nothing":
+            self.voice_state = None
+            self.flash("Didn't catch that  ·  try again closer to the mic", "idle", 2.5)
+        elif event == "error":
+            self.voice_state = None
+            self.flash("Voice error: " + str(ev.get("text", ""))[:60], "error", 4.0)
+        elif event == "heard":
+            self.voice_state = None
+            self.handle_voice(str(ev.get("text", "")))
+
+    def handle_voice(self, text):
+        """What you said: plain commands straight away (and say what happened), anything else to Claude."""
+        text = WAKE_PREFIX.sub("", text).strip()
+        pending = self.agent_approval() or (self.approvals[0] if self.approvals else None)
+        if pending is not None:
+            t = re.sub(r"['’]", "", text.lower())
+            no = re.search(r"\b(no|nope|dont|do not|deny|stop|cancel|never ?mind|nah)\b", t)
+            if not no and re.search(r"\b(yes|yeah|yep|yup|sure|go ahead|do it|allow|okay|ok|fine|please do|approve)\b", t):
+                self.decide("allow", pending)
+                return
+            if no:
+                self.decide("deny", pending)
+                return
+        if not re.search(r"\w", text):          # just "Hey GUY": listen for the rest
+            self.voice_send(listen=True)
+            return
+        said = None
+        for candidate in command_candidates(text):
+            if said := intents(candidate):
+                break
+        if said and [a for a, _arg, _l in said] == ["dismiss"]:
+            self.close_ask(explicit=True)
+            return
+        if said:
+            replies = []
+            for action, arg, _label in said:
+                reply = self.do_intent(action, arg)
+                if reply is None and action == "open" and len(said) == 1:
+                    said = None                  # not an app or folder: maybe it's a question ("show me the weather")
+                    break
+                replies.append(reply)
+            if said:
+                self.speak(". ".join(r for r in replies if r) or "Done", follow=True)
+                return
+        self.open_ask(keep=True)
+        self.entry.set_text(text)
+        self.entry.set_position(-1)
+        self.ask_claude(text, voice=True)
+
+    def show_reply(self, s):
+        """Claude Code's final reply, in full, in the Ask GUY answer panel; Tab asks about it."""
+        self.show_text(f"{s.name}  ·  Claude Code's reply", s.reply,
+                       f"What did the Claude Code session in {s.name} just say?")
+
+    def show_text(self, title, text, question):
+        self.open_ask()
+        self.stop_claude()
+        self.spinner.stop()
+        self.history = [(question, text)]
+        self.ask_label = title
+        self.answer_title.set_label(title)
+        self.answer_text = text
+        self.render_answer()
+        self.set_view("answer")
+        self.footer.set_label("Type a question about it and press Tab  ·  Ctrl+Shift+C copy  ·  Esc back")
+
+    # ----- reminders and routines -----
+    def check_schedule(self):
+        import datetime as dt
+        now = dt.datetime.now()
+        items, changed = load_schedule(), False
+        for item in list(items):
+            try:
+                at = dt.datetime.fromisoformat(item["at"])
+            except (KeyError, ValueError):
+                items.remove(item)
+                changed = True
+                continue
+            if at > now:
+                continue
+            if now - at < dt.timedelta(hours=12):      # missed by more than that (laptop off): skip it
+                self.fire(item, late=now - at > dt.timedelta(minutes=5))
+            changed = True
+            if item.get("every") in EVERY:
+                while at <= now:
+                    at = next_run(at, item["every"])
+                item["at"] = at.isoformat(timespec="minutes")
+            else:
+                items.remove(item)
+        if changed:
+            save_schedule(items)
+        self.schedule = items
+        return True
+
+    def fire(self, item, late=False):
+        if item.get("kind") == "task":
+            self.run_task(item)
+            return
+        text = item.get("text", "")
+        self.chime()
+        GLib.timeout_add(700, lambda: self.chime() and False)
+        spawn("notify-send", "-a", "GUY", "-u", "critical", "-i", "alarm-symbolic", "⏰ Reminder", text)
+        self.flash(f"⏰ {text}" + ("  ·  (missed while away)" if late else ""), "done", 15.0)
+        self.speak(f"Reminder: {text}")
+
+    def run_task(self, item):
+        """A routine: GUY's assistant does it in the background, then GUY pops up with the result."""
+        title = first_line(item.get("text", "Task"), 40)
+        act = self.set_activity(f"task:{item.get('id')}:{time.time()}", "task", title, "emblem-synchronizing-symbolic",
+                                detail="Working on it…")
+        act.state = "running"
+        prompt = ("(This is a scheduled routine: you're running on your own and the user isn't watching. Do it, "
+                  "then report the result briefly, as something they'll read or hear. If you get stuck, do all "
+                  "you can and end the report with the one question you need answered; they'll reply to it.)\n\n"
+                  + item.get("text", ""))
+
+        def work():
+            result, error = "", None
+            try:
+                out = subprocess.run(agent_cmd(stream=False), input=prompt, capture_output=True, text=True,
+                                     cwd=HOME, timeout=900).stdout
+                data = json.loads(out)
+                result = str(data.get("result") or "")
+                if data.get("is_error"):
+                    error = result or "Claude returned an error."
+            except (OSError, subprocess.SubprocessError, ValueError) as e:
+                error = str(e)
+            GLib.idle_add(self.task_done, act, result, error)
+
+        threading.Thread(target=work, daemon=True).start()
+        self.apply()
+
+    def task_done(self, act, result, error):
+        act.state = "error" if error else "done"
+        act.reply = result or f"**Error:** {error}"
+        act.detail = ("Failed: " + first_line(error, 60)) if error else first_line(result, 80) or "Done"
+        act.updated = time.time()
+        self.flash(f"{act.title} is ready  ·  click to read" if not error else f"{act.title} failed",
+                   "done" if not error else "error", 8.0)
+        spawn("notify-send", "-a", "GUY", "-i", "emblem-ok-symbolic", act.title, first_line(act.reply, 200))
+        if not error:
+            spoken = speakable(result)
+            self.speak(" ".join(re.split(r"(?<=[.!?])\s+", spoken)[:3]))
+        return False
+
+    def unschedule(self, ident):
+        save_schedule([i for i in load_schedule() if i.get("id") != ident])
+        self.schedule = load_schedule()
+        self.apply()
+
+    def pop(self, act, seconds):
+        """Pop the pill out showing an activity, live, then let it slide back in."""
+        self.flash_act = act
+        self.flash_mood = "working" if act.state == "running" else act.state
+        self.flash_until = time.monotonic() + seconds
+        GLib.timeout_add(int(seconds * 1000) + 50, self.apply)
+        self.apply()
+
+    def set_prompt(self, prompt):
+        if prompt == self.prompt:
+            return
+        fresh = prompt is not None and (self.prompt is None or self.prompt["text"] != prompt["text"])
+        self.prompt = prompt
+        if fresh:
+            self.chime()
+        self.apply()
+
+    def focus_prompt(self):
+        """Focus the terminal window the waiting package tool runs in."""
+        if not self.prompt:
+            return
+        procs = scan_procs()
+        windows = {w.get("pid"): w.get("address") for w in load_windows()}
+        for pid in self.prompts.chain(self.prompt["pid"], procs):
+            if pid in windows:
+                spawn("hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{windows[pid]}" }})')
+                break
+        self.user_mode = None
+        self.hover = False
+        self.apply()
+
+    def flash(self, text, mood, seconds):
+        self.flash_act = None
+        self.flash_text, self.flash_mood = text, mood
+        self.flash_until = time.monotonic() + seconds
+        GLib.timeout_add(int(seconds * 1000) + 50, self.apply)
+        self.apply()
+
+    # ----- animation -----
+    def kick(self):
+        if self.tick is None:
+            self.last_t = None
+            self.tick = self.island.add_tick_callback(self.on_tick)
+        return False
+
+    def on_tick(self, _w, clock):
+        t = clock.get_frame_time() / 1e6
+        dt = min(1 / 30, t - self.last_t) if self.last_t else 1 / 60
+        self.last_t = t
+        isl = self.island
+        # springs, a little underdamped so the glass overshoots and settles like liquid
+        k = 240.0
+        c = 2 * 0.66 * math.sqrt(k)
+        isl.vw += (-k * (isl.w - isl.tw) - c * isl.vw) * dt
+        isl.w += isl.vw * dt
+        kh = 210.0 if isl.th > isl.h else 300.0
+        isl.vh += (-kh * (isl.h - isl.th) - 2 * 0.7 * math.sqrt(kh) * isl.vh) * dt
+        isl.h = max(0.0, isl.h + isl.vh * dt)
+
+        if self.pending and isl.alpha <= 0.01:
+            self.stack.set_visible_child_name(self.pending)
+            self.stack.set_visible(True)
+            if self.pending == "ask":
+                self.entry.grab_focus()
+            self.pending = None
+            isl.follow = True
+            isl.queue_allocate()
+        near = abs(isl.w - isl.tw) < 0.2 * isl.tw + 6 and abs(isl.h - isl.th) < 0.25 * isl.th + 6
+        want = 0.0 if (self.pending or self.mode == "hidden") else (1.0 if near else isl.alpha)
+        if want < isl.alpha:
+            isl.alpha = max(want, isl.alpha - dt / 0.09)
+        else:
+            isl.alpha = min(want, isl.alpha + dt / 0.22)
+        if self.mode == "hidden" and isl.alpha <= 0.01 and self.stack.get_visible():
+            self.stack.set_visible(False)
+        if self.mode == "hidden":
+            isl.alpha = min(isl.alpha, max(0.0, isl.h / max(isl.th + 30, 30)))
+
+        isl.queue_draw()
+        self.update_input_region()
+        settled = (abs(isl.w - isl.tw) < 0.3 and abs(isl.vw) < 2 and abs(isl.h - isl.th) < 0.3
+                   and abs(isl.vh) < 2 and isl.alpha == want and not self.pending)
+        if settled:
+            isl.w, isl.h, isl.vw, isl.vh = isl.tw, isl.th, 0.0, 0.0
+            isl.queue_draw()
+            self.update_input_region()
+            self.tick = None
+            return False
+        return True
+
+    def update_input_region(self):
+        surf = self.win.get_surface()
+        if surf is None:
+            return False
+        isl = self.island
+        cx = SURF_W / 2
+        if isl.h < 2 and self.mode == "hidden":
+            rect = (cx - HOT_W / 2, 0, HOT_W, HOT_H)
+        else:
+            s, _r, bulge = isl.geometry()
+            rect = (cx - isl.w / 2 - s, 0, isl.w + 2 * s, max(HOT_H, isl.h + bulge))
+        surf.set_input_region(cairo.Region(cairo.RectangleInt(*(int(round(v)) for v in rect))))
+        return False
+
+    # ----- pointer -----
+    def over_target(self, x, y):
+        """Is (x, y) over where the island is heading? The shrinking glass keeps its input region
+        for a moment, and the catcher unmapping under the pointer sends an enter; neither should
+        count as the pointer arriving."""
+        isl = self.island
+        cx = SURF_W / 2
+        if isl.th < 1:
+            return abs(x - cx) <= HOT_W / 2 and y <= HOT_H + 2
+        return abs(x - cx) <= isl.tw / 2 + SHOULDER and y <= isl.th + 4
+
+    def on_enter(self, _c, x, y):
+        if self.leave_timer:
+            GLib.source_remove(self.leave_timer)
+            self.leave_timer = None
+        self.pointer = (x, y)
+        if not self.hover and self.over_target(x, y):
+            self.hover = True
+            self.apply()
+
+    def on_motion(self, x, y):
+        self.pointer = (x, y)
+        if not self.hover:
+            self.on_enter(None, x, y)
+
+    def on_leave(self, _c):
+        self.pointer = None
+        if self.leave_timer:
+            GLib.source_remove(self.leave_timer)
+        self.leave_timer = GLib.timeout_add(450, self.left)
+
+    def left(self):
+        self.leave_timer = None
+        self.hover = False
+        if self.user_mode == "home":
+            self.user_mode = None
+        self.apply()
+        return False
+
+    def open_home(self):
+        if self.user_mode is None:
+            self.user_mode = "home"
+            self.apply()
+
+    # ----- files dragged onto the island -----
+    def on_drag_enter(self, _t, _x, _y):
+        self.dragging = True
+        self.apply()
+        return Gdk.DragAction.COPY
+
+    def on_drag_leave(self, _t):
+        GLib.timeout_add(60, self.drag_over)
+
+    def drag_over(self):
+        if self.dragging:
+            self.dragging = False
+            self.apply()
+        return False
+
+    def on_drop(self, _t, value, _x, _y):
+        self.dragging = False
+        files = [f.get_path() for f in value.get_files() if f.get_path()]
+        if not files:
+            self.apply()
+            return False
+        self.open_ask(attach=files[0])
+        return True
+
+    # ----- Claude Code hooks -----
+    def on_hook(self, ev, conn):
+        if ev.get("guy_command") == "ask":
+            self.toggle_ask()
+            return False
+        if ev.get("guy_command") == "home":
+            self.user_mode = None if self.user_mode == "home" else "home"
+            self.apply()
+            return False
+        if ev.get("guy_command") == "voice":
+            self.on_voice(ev)
+            return False
+        if ev.get("guy_command") == "activity":
+            self.on_activity_command(ev)
+            return False
+        if ev.get("guy_command") == "aside":
+            # guy-computer is about to look at or use the screen: hide the panel, let go of the keyboard
+            self.agent_status = "using your computer…"
+            self.close_ask()
+            self.apply()
+            return False
+        if ev.get("guy_command") == "schedule":
+            self.schedule = load_schedule()
+            self.apply()
+            return False
+        if ev.get("guy_agent"):
+            # GUY's own assistant wants to do something risky; asked in the Ask panel, on the island, or aloud
+            a = Approval(conn, ev, Session("guy-agent", "GUY"))
+            self.approvals.append(a)
+            self.chime()
+            if self.voice_gen == self.claude_gen and self.claude_proc is not None:
+                self.speak(f"Can I {a.risk}? Say yes or no.", follow=True)
+            self.apply()
+            return True
+        name = ev.get("hook_event_name", "")
+        sid = str(ev.get("session_id") or "?")
+        s = self.sessions.get(sid)
+        if s is None:
+            if name == "SessionEnd":
+                return False
+            s = self.sessions[sid] = Session(sid, str(ev.get("cwd") or ""))
+        s.updated = time.time()
+        keep = False
+        if name == "SessionStart":
+            s.status, s.last = "idle", "Started"
+        elif name == "UserPromptSubmit":
+            prompt = (str(ev.get("prompt", "")).strip().splitlines() or [""])[0]
+            s.status, s.last = "working", f"“{prompt[:90]}”"
+        elif name == "PreToolUse" and ev.get("tool_name") == "AskUserQuestion":
+            # Claude is asking you something in the terminal: stay out until it's answered
+            s.status, s.last = "waiting", "Asks: " + question_text(ev.get("tool_input"))
+            self.chime()
+        elif name == "PermissionRequest" and ev.get("tool_name") == "AskUserQuestion":
+            # not a permission to grant: let the terminal show the question (the relay prints nothing)
+            s.status, s.last = "waiting", "Asks: " + question_text(ev.get("tool_input"))
+        elif name in ("PreToolUse", "PostToolUse"):
+            s.status, s.last = "working", describe_tool(ev.get("tool_name"), ev.get("tool_input"))
+        elif name == "PostToolUseFailure":
+            s.last = "Failed: " + describe_tool(ev.get("tool_name"), ev.get("tool_input"))
+        elif name == "PermissionRequest":
+            s.status = "waiting"
+            s.last = "Waiting: " + describe_tool(ev.get("tool_name"), ev.get("tool_input"))
+            self.approvals.append(Approval(conn, ev, s))
+            self.chime()
+            keep = True
+        elif name == "Notification":
+            msg = str(ev.get("message", ""))
+            if "waiting for your input" in msg.lower():
+                if s.status != "waiting":
+                    s.status = "idle"
+            elif msg:
+                s.last = msg
+        elif name == "Stop":
+            s.reply = str(ev.get("last_reply") or ev.get("last_assistant_message") or "").strip()
+            summary = first_line(s.reply)
+            s.status, s.last = "done", summary or "Finished"      # quietly: it's in the overview
+        elif name == "StopFailure":
+            s.status, s.last = "error", "Stopped with an error"
+        elif name == "SessionEnd":
+            self.sessions.pop(sid, None)
+        self.apply()
+        return keep
+
+    def on_hook_gone(self, conn):
+        """The relay hung up: answered in the terminal, timed out, or the session ended."""
+        before = len(self.approvals)
+        self.approvals = [a for a in self.approvals if a.conn is not conn]
+        if len(self.approvals) != before:
+            self.settle_waiting()
+            self.apply()
+
+    def agent_approval(self):
+        return next((a for a in self.approvals if a.agent), None)
+
+    def decide(self, decision, approval=None):
+        if not self.approvals:
+            return
+        a = approval if approval in self.approvals else self.approvals[0]
+        self.approvals.remove(a)
+        if self.server:
+            self.server.reply(a.conn, decision)
+        self.settle_waiting()
+        self.apply()
+
+    def settle_waiting(self):
+        waiting = {a.session.id for a in self.approvals}
+        for s in self.sessions.values():
+            if s.status == "waiting" and s.id not in waiting:
+                s.status = "working"
+
+    def chime(self):
+        sound = "/usr/share/sounds/freedesktop/stereo/message.oga"
+        if os.path.exists(sound) and shutil.which("pw-play"):
+            spawn("pw-play", "--volume", "0.5", sound)
+
+    def prune(self):
+        now = time.time()
+        stale = [sid for sid, s in self.sessions.items()
+                 if now - s.updated > (600 if s.status in ("done", "error") else 2700)
+                 and not any(a.session is s for a in self.approvals)]
+        for sid in stale:
+            del self.sessions[sid]
+        # finished activities fade from the list after 10 min; a pacman run that went quiet (a sync
+        # with nothing to do) after 3
+        gone = [k for k, a in self.activities.items()
+                if (a.state != "running" and now - a.updated > 600)
+                or (a.state == "running" and a.kind == "update" and now - a.updated > 180)
+                or (a.state == "running" and a.kind == "custom" and now - a.updated > 3600)]
+        for k in gone:
+            del self.activities[k]
+        if stale or gone:
+            self.apply()
+        return True
+
+    # ----- Ask GUY -----
+    def toggle_ask(self):
+        if self.user_mode == "ask":
+            self.close_ask()
+        else:
+            self.open_ask()
+
+    def open_ask(self, attach=None, keep=False):
+        if self.user_mode != "ask" and keep and time.monotonic() < self.convo_until:
+            self.user_mode = "ask"               # back to the same conversation
+            self.apply()
+            return
+        if self.user_mode != "ask":
+            self.apps = load_apps()
+            self.windows = load_windows()
+            self.icon_by_class = {}
+            for a in self.apps:
+                self.icon_by_class.setdefault(a["id"].removesuffix(".desktop").lower(), a["icon"])
+                if a["wmclass"]:
+                    self.icon_by_class.setdefault(a["wmclass"], a["icon"])
+            self.history = []
+            self.agent_session = None
+            self.entry.set_text("")
+            self.set_attachment(None)
+            self.show_items([])
+            self.set_view("idle")
+        self.user_mode = "ask"
+        if attach:
+            self.set_attachment(attach)
+        self.apply()
+        self.entry.grab_focus()
+
+    def close_ask(self, explicit=False):
+        """Hide the panel. Clicking away (explicit=False) leaves GUY talking, working and listening for a
+        follow-up; Esc or "stop" (explicit=True) ends the conversation."""
+        if explicit:
+            self.voice_send(stop=True)
+            self.stop_claude()
+            self.convo_until = 0.0
+        if self.user_mode == "ask":
+            # shrink straight into the small pill (one smooth morph), which then slides up out of
+            # sight a moment later unless the pointer is on it
+            self.user_mode = None
+            self.hover = False
+            self.linger_until = time.monotonic() + 1.0
+            GLib.timeout_add(1050, self.apply)
+            self.apply()
+
+    def enter_ask(self):
+        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.EXCLUSIVE)
+        self.catcher.present()
+
+    def leave_ask(self):
+        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.NONE)
+        self.catcher.set_visible(False)
+
+    def set_attachment(self, path):
+        self.attachment = path
+        self.chip.set_visible(bool(path))
+        if path:
+            self.chip_label.set_label(os.path.basename(path))
+            self.entry.set_placeholder_text("Ask GUY about this file")
+            self.refresh(self.entry.get_text())
+        else:
+            self.entry.set_placeholder_text("Ask GUY")
+
+    def set_view(self, view):
+        self.view = view
+        self.list_scroll.set_visible(view == "results")
+        self.answer_box.set_visible(view == "answer")
+        self.sep.set_visible(view != "idle")
+        hint = {"idle": HINT_IDLE, "results": HINT_RESULTS, "answer": HINT_ANSWER}[view]
+        if self.attachment and view != "answer":
+            hint = HINT_FILE
+        self.footer.set_label(hint)
+
+    def on_changed(self, _entry):
+        self.mode_list = "search"
+        self.file_gen += 1
+        text = self.entry.get_text()
+        if self.view == "answer":
+            self.set_view("results" if text.strip() else "idle")
+        self.refresh(text)
+
+    def refresh(self, text):
+        q = text.strip()
+        items = []
+        if self.attachment:
+            name = os.path.basename(self.attachment)
+            items.append({"kind": "claude", "title": f"Ask GUY about {name}" + (f": {q}" if q else ""),
+                          "subtitle": "GUY reads the file, then answers right here",
+                          "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
+        elif q and (said := intents(q)):
+            icon = {"timer": "alarm-symbolic", "timer-cancel": "alarm-symbolic", "open": "system-run-symbolic",
+                    "dismiss": "window-close-symbolic",
+                    "update-system": "system-software-update-symbolic"}.get(said[0][0], "audio-volume-medium-symbolic")
+            if said[0][0] in ("next", "previous", "pause", "play", "whats-playing"):
+                icon = "multimedia-player-symbolic"
+            items.append({"kind": "do", "title": ", then ".join(x[2] for x in said), "subtitle": "Enter to do it",
+                          "icon": icon, "hint": "Enter", "intents": said})
+            items.append({"kind": "claude", "title": f"Ask GUY: {q}", "subtitle": "Answer right here",
+                          "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
+        elif q:
+            result = calculate(q)
+            if result is not None:
+                items.append({"kind": "calc", "title": result, "subtitle": f"{q}  ·  Enter to copy",
+                              "icon": "accessories-calculator", "hint": "Copy", "value": result.replace(" ", "")})
+            apps = sorted(((score(q, a["name"], a["extra"]), a) for a in self.apps), key=lambda t: -t[0])
+            for s, a in apps[:MAX_APPS]:
+                if s > 0:
+                    items.append({"kind": "app", "title": a["name"], "subtitle": a["generic"],
+                                  "icon": a["icon"], "hint": "Open", "app": a})
+            wins = sorted(((score(q, w.get("title", ""), w["class"].lower()), w) for w in self.windows),
+                          key=lambda t: -t[0])
+            for s, w in wins[:MAX_WINDOWS]:
+                if s > 0:
+                    items.append({"kind": "window", "title": w.get("title") or w["class"],
+                                  "subtitle": f"{w['class']}  ·  desktop {w.get('workspace', {}).get('name', '?')}",
+                                  "icon": self.icon_by_class.get(w["class"].lower(), w["class"].lower()),
+                                  "hint": "Switch", "window": w})
+            follow = "Follow up" if self.history else "Ask GUY"
+            items.append({"kind": "claude", "title": f"{follow}: {q}", "subtitle": "Answer right here",
+                          "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
+            items.append({"kind": "web", "title": f"Search Google for “{q}”", "subtitle": "Opens in your browser",
+                          "icon": "web-browser", "hint": "Ctrl+↵", "query": q})
+        self.show_items(items)
+
+    def show_items(self, items):
+        self.items = items
+        while (row := self.listbox.get_row_at_index(0)) is not None:
+            self.listbox.remove(row)
+        for item in items:
+            row = Gtk.ListBoxRow()
+            if item["kind"] == "calc":
+                row.add_css_class("calc")
+            box = Gtk.Box(spacing=14)
+            icon = item["icon"]
+            img = Gtk.Image.new_from_gicon(icon) if isinstance(icon, Gio.Icon) else Gtk.Image.new_from_icon_name(icon)
+            img.set_pixel_size(30)
+            box.append(img)
+            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
+            title = Gtk.Label(label=item["title"], xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            title.add_css_class("rtitle")
+            texts.append(title)
+            if item.get("subtitle"):
+                sub = Gtk.Label(label=item["subtitle"], xalign=0, ellipsize=Pango.EllipsizeMode.END)
+                sub.add_css_class("rsub")
+                texts.append(sub)
+            box.append(texts)
+            hint = Gtk.Label(label=item.get("hint", ""), valign=Gtk.Align.CENTER)
+            hint.add_css_class("hint")
+            box.append(hint)
+            row.set_child(box)
+            self.listbox.append(row)
+        if items:
+            self.listbox.select_row(self.listbox.get_row_at_index(0))
+        if self.view != "answer":
+            self.set_view("results" if items else "idle")
+
+    def move_selection(self, delta):
+        row = self.listbox.get_selected_row()
+        idx = (row.get_index() if row else -1) + delta
+        idx = max(0, min(len(self.items) - 1, idx))
+        target = self.listbox.get_row_at_index(idx)
+        if target is None:
+            return
+        self.listbox.select_row(target)
+        ok, bounds = target.compute_bounds(self.listbox)
+        if ok:
+            adj = self.list_scroll.get_vadjustment()
+            top, bottom = bounds.get_y(), bounds.get_y() + bounds.get_height()
+            if top < adj.get_value():
+                adj.set_value(top)
+            elif bottom > adj.get_value() + adj.get_page_size():
+                adj.set_value(bottom - adj.get_page_size())
+
+    def activate_index(self, idx):
+        if not (0 <= idx < len(self.items)):
+            return
+        item = self.items[idx]
+        kind = item["kind"]
+        if kind == "calc":
+            subprocess.run(["wl-copy", item["value"]])
+            self.close_ask()
+        elif kind == "app":
+            spawn("uwsm", "app", "--", item["app"]["id"])
+            self.close_ask()
+        elif kind == "window":
+            addr = item["window"]["address"]
+            spawn("hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{addr}" }})')
+            self.close_ask()
+        elif kind == "do":
+            self.close_ask()
+            for action, arg, _label in item["intents"]:
+                self.do_intent(action, arg)
+        elif kind == "claude":
+            self.ask_claude(item["query"])
+        elif kind == "web":
+            spawn("xdg-open", "https://www.google.com/search?q=" + urllib.parse.quote_plus(item["query"]))
+            self.close_ask()
+        elif kind == "file":
+            spawn("xdg-open", item["path"])
+            self.close_ask()
+
+    def search_files(self):
+        term = self.entry.get_text().strip()
+        if not term:
+            return
+        self.file_gen += 1
+        gen = self.file_gen
+        self.mode_list = "files"
+        self.show_items([{"kind": "info", "title": f"Searching files for “{term}”…", "subtitle": "",
+                          "icon": "folder-saved-search", "hint": ""}])
+
+        def work():
+            try:
+                out = subprocess.run(["fd", "-i", "-F", "--max-results", str(MAX_FILES), "--", term, str(HOME)],
+                                     capture_output=True, text=True, timeout=15).stdout.splitlines()
+            except (OSError, subprocess.SubprocessError):
+                out = []
+            GLib.idle_add(self.show_files, gen, term, out)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_files(self, gen, term, paths):
+        if gen != self.file_gen:
+            return False
+        items = []
+        for p in paths:
+            is_dir = p.endswith("/")
+            path = p.rstrip("/")
+            items.append({"kind": "file", "title": os.path.basename(path),
+                          "subtitle": os.path.dirname(path).replace(str(HOME), "~", 1),
+                          "icon": "folder" if is_dir else "text-x-generic", "hint": "Open", "path": path})
+        if not items:
+            items = [{"kind": "info", "title": f"No files matching “{term}”", "subtitle": "",
+                      "icon": "dialog-information-symbolic", "hint": ""}]
+        self.show_items(items)
+        return False
+
+    def ask_claude(self, query, voice=False):
+        query = query.strip()
+        if not query and not self.attachment:
+            return
+        self.stop_claude()
+        self.claude_gen += 1
+        gen = self.claude_gen
+        self.answer_text = ""
+        self.last_query = query or "What is this file? Summarise it briefly."
+        label = self.ask_label = query or f"About {os.path.basename(self.attachment)}"
+        self.answer_title.set_label(f"GUY  ·  {label}")
+        self.answer_label.set_text("")
+        self.spinner.start()
+        self.set_view("answer")
+
+        prompt = ""
+        if self.history and not self.agent_session:
+            prompt += "Earlier in this conversation:\n\n" + "\n\n".join(
+                f"User: {q}\nGUY: {a}" for q, a in self.history[-4:]) + "\n\nNow the user asks:\n"
+        if self.attachment:
+            prompt += f"The user attached the file {self.attachment}. Read it before answering.\n\n"
+        prompt += self.last_query
+        if voice:
+            prompt += ("\n\n(Asked out loud: answer in one to three short sentences that sound natural spoken, "
+                       "with no Markdown, lists or code unless they're really needed.)")
+            self.voice_gen = self.claude_gen
+
+        cmd = agent_cmd(resume=self.agent_session)
+        if self.attachment and not self.attachment.startswith(str(HOME) + "/"):
+            cmd += ["--add-dir", os.path.dirname(self.attachment)]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, cwd=HOME, start_new_session=True)
+        except OSError as e:
+            self.claude_done(gen, f"Couldn't start Claude Code: {e}")
+            return
+        self.claude_proc = proc
+        self.ask_face.mood = "working"
+
+        def work():
+            try:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+            except OSError:
+                pass
+            error = None
+            for line in proc.stdout:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("type") == "stream_event":
+                    e = ev.get("event", {})
+                    if e.get("type") == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta":
+                        GLib.idle_add(self.claude_delta, gen, e["delta"]["text"])
+                    elif e.get("type") == "content_block_start":
+                        block = e.get("content_block", {})
+                        if block.get("type") in ("tool_use", "server_tool_use"):
+                            GLib.idle_add(self.claude_tool, gen, block.get("name", ""), label)
+                elif ev.get("type") == "result" and ev.get("is_error"):
+                    error = str(ev.get("result") or "Claude returned an error.")
+                if ev.get("type") in ("system", "result") and ev.get("session_id"):
+                    GLib.idle_add(self.set_agent_session, gen, ev["session_id"])
+            proc.wait()
+            if error is None and proc.returncode not in (0, None, -signal.SIGTERM):
+                error = (proc.stderr.read() or "").strip()[-600:] or f"Claude exited with code {proc.returncode}."
+            GLib.idle_add(self.claude_done, gen, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_agent_session(self, gen, sid):
+        if gen == self.claude_gen and self.user_mode == "ask":
+            self.agent_session = sid
+        return False
+
+    def claude_tool(self, gen, name, label):
+        if gen == self.claude_gen:
+            self.agent_status = TOOL_STATUS.get(name, "working…")
+            if self.user_mode != "ask":
+                self.apply()
+        """Claude went to use a tool: show what it's doing, and drop the "let me look" preamble."""
+        if gen == self.claude_gen:
+            self.answer_text = ""
+            self.answer_label.set_text("")
+            self.answer_title.set_label(f"GUY  ·  {label}  ·  {TOOL_STATUS.get(name, 'working…')}")
+        return False
+
+    def claude_delta(self, gen, text):
+        if gen == self.claude_gen:
+            self.answer_text += text
+            self.render_answer()
+        return False
+
+    def claude_done(self, gen, error):
+        if gen != self.claude_gen:
+            return False
+        self.spinner.stop()
+        self.answer_title.set_label(f"GUY  ·  {self.ask_label}")
+        self.claude_proc = None
+        self.ask_face.mood = self.mood()
+        if error:
+            self.answer_text += ("\n\n" if self.answer_text else "") + f"**Error:** {error}"
+            self.ask_face.mood = "error"
+        elif not self.answer_text:
+            self.answer_text = "_No answer received._"
+        else:
+            self.history.append((self.last_query, self.answer_text))
+            if gen == self.voice_gen:
+                self.speak(self.answer_text, follow=True)
+        self.convo_until = time.monotonic() + 180
+        self.agent_status = ""
+        self.render_answer()
+        if self.user_mode != "ask":              # the panel was closed meanwhile: say so on the pill
+            act = self.set_activity("answer", "task", "GUY", "dialog-information-symbolic",
+                                    detail=first_line(self.answer_text, 80))
+            act.state, act.reply = ("error" if error else "done"), self.answer_text
+            self.flash(first_line(self.answer_text, 70) + "  ·  click to read", "error" if error else "done", 6.0)
+        return False
+
+    def render_answer(self):
+        markup = md_to_markup(self.answer_text)
+        try:
+            Pango.parse_markup(markup, -1, "\0")
+            self.answer_label.set_markup(markup)
+        except GLib.Error:
+            self.answer_label.set_text(self.answer_text)
+
+    def stop_claude(self):
+        proc, self.claude_proc = self.claude_proc, None
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def on_key(self, _ctrl, keyval, _code, state):
+        if self.mode != "ask":
+            return False
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(state & Gdk.ModifierType.ALT_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if keyval == Gdk.KEY_Escape:
+            if self.view == "answer":
+                self.stop_claude()
+                self.spinner.stop()
+                self.set_view("results" if self.items else "idle")
+            else:
+                self.close_ask(explicit=True)
+            return True
+        if keyval in (Gdk.KEY_Down, Gdk.KEY_Up) and self.view == "results":
+            self.move_selection(1 if keyval == Gdk.KEY_Down else -1)
+            return True
+        if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+            self.ask_claude(self.entry.get_text())
+            return True
+        if alt and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            self.search_files()
+            return True
+        if ctrl and not shift and keyval in (Gdk.KEY_y, Gdk.KEY_n) and self.agent_approval() is not None:
+            self.decide("allow" if keyval == Gdk.KEY_y else "deny", self.agent_approval())
+            return True
+        if ctrl and shift and keyval in (Gdk.KEY_c, Gdk.KEY_C) and self.answer_text:
+            subprocess.run(["wl-copy", self.answer_text])
+            self.footer.set_label("Answer copied to clipboard")
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            text = self.entry.get_text().strip()
+            if ctrl and text:
+                spawn("xdg-open", "https://www.google.com/search?q=" + urllib.parse.quote_plus(text))
+                self.close_ask()
+            elif self.view == "results":
+                row = self.listbox.get_selected_row()
+                self.activate_index(row.get_index() if row else 0)
+            elif self.attachment:
+                self.ask_claude(text)
+            return True
+        return False
+
+
+def main():
+    args = sys.argv[1:]
+    if args in (["--install-hooks"], ["--uninstall-hooks"]):
+        return hooks_cli(args == ["--install-hooks"])
+    app = Gtk.Application(application_id="local.guy", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+    state = {}
+
+    def command_line(app, cmdline):
+        if "guy" not in state:
+            state["guy"] = Guy(app)
+            app.hold()
+        argv = cmdline.get_arguments()[1:]
+        if argv == ["--ask"]:
+            state["guy"].toggle_ask()
+        elif argv:
+            print("usage: guy [--ask | --install-hooks | --uninstall-hooks]", file=sys.stderr)
+        return 0
+
+    app.connect("command-line", command_line)
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
