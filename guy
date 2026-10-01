@@ -360,6 +360,7 @@ window.guy, window.guy.background, window.guy-catcher, window.guy-catcher.backgr
 .slast { font-size: 12.5px; color: rgba(255, 255, 255, 0.68); }
 .sage { font-size: 11px; color: rgba(255, 255, 255, 0.40); }
 .session.clickable:hover { background: rgba(255, 255, 255, 0.11); }
+.session .more { padding: 2px 0 4px 40px; font-size: 12.5px; color: rgba(255, 255, 255, 0.80); }
 .aicon { color: rgba(255, 255, 255, 0.75); }
 .session progressbar trough { min-height: 3px; border-radius: 99px; background: rgba(255, 255, 255, 0.10); border: none; }
 .session progressbar progress { min-height: 3px; border-radius: 99px; background: rgba(255, 255, 255, 0.75); border: none; }
@@ -1384,6 +1385,7 @@ class HookServer:
 class Session:
     def __init__(self, sid, cwd):
         self.id = sid
+        self.cwd = cwd or ""
         self.name = os.path.basename(cwd.rstrip("/")) or cwd or "Claude Code"
         self.status = "idle"
         self.last = "Started"
@@ -1831,6 +1833,8 @@ class Guy:
         self.activities = {}
         self.updates = None        # (count, "pacman 10  ·  yay 2") from HyDE's checker
         self.faces = []
+        self.home_expanded = None  # the overview row that's open, showing everything about it
+        self.home_shown = None     # what the overview's rows were last built from
         # Ask GUY
         self.items, self.view, self.mode_list = [], "idle", "search"
         self.claude_proc, self.claude_gen, self.answer_text = None, 0, ""
@@ -2219,18 +2223,29 @@ class Guy:
 
     def refresh_home(self):
         """The overview's rows, rebuilt from scratch: only while it's on screen (apply() runs on every
-        download tick, pacman line and voice partial, and nobody sees these rows then)."""
-        while (child := self.session_box.get_first_child()) is not None:
-            self.session_box.remove(child)
+        download tick, pacman line and voice partial, and nobody sees these rows then), and only when
+        what they show has changed, so a row isn't swapped out from under a click."""
         sessions = sorted(self.sessions.values(), key=lambda s: -s.updated)[:3]
         acts = sorted(self.activities.values(), key=lambda a: (a.state != "running", -a.updated))[:3]
         updates = self.updates if self.updates and self.updates[0] else None
+        schedule = sorted(self.schedule, key=lambda i: i.get("at", ""))[:3]
+        playing = self.media.now and self.media.now["status"] == "Playing"
+        shown = (self.prompt, self.home_expanded, updates, playing,
+                 [(s.id, s.status, s.last, bool(s.reply), age(s.updated)) for s in sessions],
+                 [(a.key, a.state, a.title, a.detail, a.progress, bool(a.open), bool(getattr(a, "reply", None)),
+                   age(a.updated)) for a in acts],
+                 [(i.get("id"), i.get("at"), i.get("text"), i.get("every"), i.get("last_at")) for i in schedule])
+        if shown == self.home_shown:
+            return
+        self.home_shown = shown
+        while (child := self.session_box.get_first_child()) is not None:
+            self.session_box.remove(child)
         if self.prompt:
             icon = Gtk.Image.new_from_icon_name("dialog-password-symbolic" if self.prompt["kind"] == "password"
                                                 else "input-keyboard-symbolic")
             icon.add_css_class("aicon")
             self.add_row(icon, self.prompt["text"], "Click to go to the terminal", None, self.focus_prompt)
-        if not (sessions or acts or updates or self.prompt or self.schedule):
+        if not (sessions or acts or updates or self.prompt or schedule):
             empty = Gtk.Label(xalign=0, wrap=True, max_width_chars=60,
                               label="Nothing running. Drop a file on me, or press Alt+Space and ask me anything.")
             empty.add_css_class("empty")
@@ -2240,7 +2255,8 @@ class Guy:
             dot.add_css_class("dot")
             dot.add_css_class(s.status)
             click = (lambda s=s: self.show_reply(s)) if s.reply else None
-            self.add_row(dot, s.name, s.last, age(s.updated), click)
+            more = [("Folder", s.cwd.replace(str(HOME), "~", 1)), ("Now", s.last), ("Status", s.status)]
+            self.add_row(dot, s.name, s.last, age(s.updated), click, key=f"session:{s.id}", more=more)
         for a in acts:
             icon = Gtk.Image.new_from_icon_name(a.icon)
             icon.add_css_class("aicon")
@@ -2250,7 +2266,6 @@ class Guy:
             trailing, when = None, age(a.updated)
             if a.kind == "media":
                 trailing, when = Gtk.Box(spacing=4), None
-                playing = self.media.now and self.media.now["status"] == "Playing"
                 for icon_name, action in (("media-skip-backward-symbolic", "previous"),
                                           ("media-playback-pause-symbolic" if playing else "media-playback-start-symbolic",
                                            "play-pause"),
@@ -2261,30 +2276,57 @@ class Guy:
                     b.connect("clicked", lambda _b, x=action: self.do_intent(x, None, quiet=True))
                     trailing.append(b)
             elif a.kind == "timer" and a.state == "running":
-                trailing, when = Gtk.Button(label="Cancel"), None
-                trailing.add_css_class("action")
-                trailing.add_css_class("small")
-                trailing.connect("clicked", lambda _b, k=a.key: self.remove_activity(k))
-            self.add_row(icon, a.title, a.detail, when, click, a.progress, trailing)
-        for item in sorted(self.schedule, key=lambda i: i.get("at", ""))[:2]:
-            icon = Gtk.Image.new_from_icon_name("alarm-symbolic" if item.get("kind") == "remind" else "view-calendar-symbolic")
+                trailing, when = self.small_button("Cancel", lambda k=a.key: self.remove_activity(k)), None
+            more = [("", a.title), ("", a.detail),
+                    ("Status", {"running": "working on it…", "done": "done", "error": "failed"}.get(a.state, a.state))]
+            self.add_row(icon, a.title, a.detail, when, click, a.progress, trailing, key=f"act:{a.key}", more=more)
+        for item in schedule:
+            routine = item.get("kind") == "task"
+            icon = Gtk.Image.new_from_icon_name("view-calendar-symbolic" if routine else "alarm-symbolic")
             icon.add_css_class("aicon")
-            cancel = Gtk.Button(label="Cancel")
-            cancel.add_css_class("action")
-            cancel.add_css_class("small")
-            cancel.connect("clicked", lambda _b, i=item.get("id"): self.unschedule(i))
             when = item.get("at", "").replace("T", " ")[5:16]
-            self.add_row(icon, item.get("text", ""), when + (f"  ·  every {item['every']}" if item.get("every") else ""),
-                         None, None, None, cancel)
+            every = f"  ·  every {item['every']}" if item.get("every") else ""
+            buttons = [("Cancel", lambda i=item.get("id"): self.unschedule(i))]
+            if routine:
+                buttons.insert(0, ("Run now", lambda i=item: self.run_task(i)))
+            if item.get("last_result"):
+                buttons.insert(0, ("Last result", lambda i=item: self.show_text(
+                    first_line(i.get("text", "Routine"), 40), i["last_result"],
+                    f"What did the routine “{i.get('text', '')}” report?")))
+            more = [("", item.get("text", "")),
+                    ("Next", self.when_text(item.get("at", "")) + every),
+                    ("Kind", "a routine GUY does for you" if routine else "a reminder"),
+                    ("Last run", self.when_text(item.get("last_at", "")) if item.get("last_at") else "not yet")]
+            self.add_row(icon, item.get("text", ""), when + every, None, None, None,
+                         self.small_button("Cancel", buttons[-1][1]), key=f"sched:{item.get('id')}",
+                         more=more, buttons=buttons[:-1])
         if updates:
             icon = Gtk.Image.new_from_icon_name("system-software-update-symbolic")
             icon.add_css_class("aicon")
-            button = Gtk.Button(label="Update")
-            button.add_css_class("action")
-            button.add_css_class("small")
-            button.connect("clicked", lambda *_: self.run_update())
             noun = "update" if updates[0] == 1 else "updates"
-            self.add_row(icon, f"{updates[0]} {noun} available", updates[1], None, None, None, button)
+            self.add_row(icon, f"{updates[0]} {noun} available", updates[1], None, None, None,
+                         self.small_button("Update", self.run_update), key="updates",
+                         more=[("", updates[1]), ("", "Update opens kitty running yay -Syu")])
+
+    def small_button(self, label, fn):
+        b = Gtk.Button(label=label)
+        b.add_css_class("action")
+        b.add_css_class("small")
+        b.connect("clicked", lambda *_: fn())
+        return b
+
+    @staticmethod
+    def when_text(iso):
+        import datetime as dt
+        try:
+            return dt.datetime.fromisoformat(iso).strftime("%a %-d %b, %H:%M")
+        except ValueError:
+            return iso
+
+    def toggle_expanded(self, key):
+        self.home_expanded = None if self.home_expanded == key else key
+        self.apply()
+
     def refresh_approval(self):
         # on the island, or in the Ask panel when that's open and it's GUY's own assistant asking
         agent = self.agent_approval()
@@ -2303,10 +2345,18 @@ class Guy:
             more = len(self.approvals) - 1
             self.ap_more.set_label(f"{more} more waiting" if more else "")
 
-    def add_row(self, lead, title, detail, when, click=None, progress=None, trailing=None):
+    def add_row(self, lead, title, detail, when, click=None, progress=None, trailing=None,
+                key=None, more=None, buttons=()):
+        """One row of the overview. A row with something to open opens it; any other row with a key
+        expands in place to show everything about it (the full text, `more`, and its `buttons`)."""
+        expanded = key is not None and self.home_expanded == key
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        outer.add_css_class("session")
         row = Gtk.Box(spacing=10)
-        row.add_css_class("session")
-        row.append(lead)
+        outer.append(row)
+        hit = Gtk.Box(spacing=10, hexpand=True)  # what a click lands on: not the row's own buttons
+        row.append(hit)
+        hit.append(lead)
         text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True, valign=Gtk.Align.CENTER)
         line = Gtk.Box(spacing=10)
         name = Gtk.Label(label=title, xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=34)
@@ -2319,19 +2369,43 @@ class Guy:
         if progress is not None:
             bar = Gtk.ProgressBar(fraction=max(0.0, min(1.0, progress)))
             text.append(bar)
-        row.append(text)
+        hit.append(text)
         if when:
             label = Gtk.Label(label=when)
             label.add_css_class("sage")
-            row.append(label)
+            hit.append(label)
+        if click is None and key is not None and (more or buttons):
+            click = lambda: self.toggle_expanded(key)          # noqa: E731
+            chevron = Gtk.Image.new_from_icon_name("pan-up-symbolic" if expanded else "pan-down-symbolic")
+            chevron.add_css_class("dim")
+            hit.append(chevron)
         if trailing:
             row.append(trailing)
+        if expanded:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            box.add_css_class("more")
+            for label, value in more or ():
+                if not value:
+                    continue
+                v = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, selectable=True,
+                              max_width_chars=80)
+                v.set_markup((f"<b>{GLib.markup_escape_text(label)}</b>  " if label else "")
+                             + GLib.markup_escape_text(str(value)))
+                v.set_focusable(False)
+                box.append(v)
+            if buttons:
+                brow = Gtk.Box(spacing=6, margin_top=4)
+                for blabel, fn in buttons:
+                    brow.append(self.small_button(blabel, fn))
+                box.append(brow)
+            outer.append(box)
         if click:
-            row.add_css_class("clickable")
+            outer.add_css_class("clickable")
             gesture = Gtk.GestureClick()
-            gesture.connect("released", lambda *_: click())
-            row.add_controller(gesture)
-        self.session_box.append(row)
+            # on press, not release: the list can be rebuilt between the two, and the click would be lost
+            gesture.connect("pressed", lambda *_: click())
+            hit.add_controller(gesture)
+        self.session_box.append(outer)
 
     # ----- activities -----
     def set_activity(self, key, kind, title, icon, detail=None, open=None):
@@ -2707,6 +2781,7 @@ class Guy:
         act = self.set_activity(f"task:{item.get('id')}:{time.time()}", "task", title, "emblem-synchronizing-symbolic",
                                 detail="Working on it…")
         act.state = "running"
+        act.sched_id = item.get("id")
         prompt = ("(This is a scheduled routine: you're running on your own and the user isn't watching. Do it, "
                   "then report the result briefly, as something they'll read or hear. If you get stuck, do all "
                   "you can and end the report with the one question you need answered; they'll reply to it.)\n\n"
@@ -2733,6 +2808,15 @@ class Guy:
         act.reply = result or f"**Error:** {error}"
         act.detail = ("Failed: " + first_line(error, 60)) if error else first_line(result, 80) or "Done"
         act.updated = time.time()
+        if getattr(act, "sched_id", None) is not None:
+            import datetime as dt
+            items = load_schedule()
+            for i in items:
+                if i.get("id") == act.sched_id:
+                    i["last_result"] = act.reply
+                    i["last_at"] = dt.datetime.now().isoformat(timespec="minutes")
+            save_schedule(items)
+            self.schedule = items
         self.flash(f"{act.title} is ready  ·  click to read" if not error else f"{act.title} failed",
                    "done" if not error else "error", 8.0)
         spawn("notify-send", "-a", "GUY", "-i", "emblem-ok-symbolic", act.title, first_line(act.reply, 200))
