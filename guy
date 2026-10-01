@@ -411,12 +411,15 @@ list.results > row:hover:not(:selected) { background-color: rgba(255, 255, 255, 
 .hint { font-size: 11px; color: rgba(255, 255, 255, 0.42); }
 .answer-head { padding: 12px 18px 2px 18px; font-size: 12px; color: rgba(255, 255, 255, 0.55); }
 .answer { font-size: 14px; color: rgba(255, 255, 255, 0.93); padding: 6px 18px 14px 18px; }
+.chat { padding: 4px 0 6px 0; }
+.you { font-size: 14px; color: #ffffff; background-color: rgba(255, 255, 255, 0.12); border-radius: 14px;
+       padding: 7px 12px; margin: 8px 18px 0 90px; }
 .footer { font-size: 10.5px; color: rgba(255, 255, 255, 0.42); padding: 7px 18px 11px 18px; }
 """
 
 HINT_IDLE = "Type to search apps, windows and math  ·  Tab ask GUY  ·  Alt+F files  ·  Ctrl+Enter web"
 HINT_RESULTS = "↑↓ select  ·  Enter open  ·  Tab ask GUY  ·  Alt+F files  ·  Ctrl+Enter web"
-HINT_ANSWER = "Type a follow-up and press Tab  ·  Ctrl+Shift+C copy answer  ·  Esc back"
+HINT_ANSWER = "Type a follow-up and press Enter  ·  Ctrl+Shift+C copy answer  ·  Esc back to search"
 HINT_FILE = "Enter or Tab ask GUY about the file  ·  Esc close"
 
 
@@ -577,16 +580,32 @@ def md_to_markup(text):
 
 
 # ---------- data sources ----------
+_apps_cache = None
+
+
+def _apps_changed(_monitor):
+    global _apps_cache
+    _apps_cache = None
+
+
 def load_apps():
+    """Every launchable app, cached: reading all the .desktop files is the slowest part of opening Ask
+    GUY, so it's done once and redone only when Gio says the installed apps changed."""
+    global _apps_cache
+    if _apps_cache is not None:
+        return _apps_cache
     apps = []
     for info in Gio.AppInfo.get_all():
         if not info.should_show() or not isinstance(info, DesktopAppInfo):
             continue
         extra = " ".join(filter(None, [info.get_generic_name(), " ".join(info.get_keywords() or []),
                                        info.get_description(), (info.get_id() or "").removesuffix(".desktop")]))
-        apps.append({"id": info.get_id(), "name": info.get_display_name() or info.get_name(),
+        name = info.get_display_name() or info.get_name()
+        apps.append({"id": info.get_id(), "name": name,
                      "icon": info.get_icon(), "generic": info.get_generic_name() or "",
-                     "extra": extra.lower(), "wmclass": (info.get_startup_wm_class() or "").lower()})
+                     "extra": extra.lower(), "wmclass": (info.get_startup_wm_class() or "").lower(),
+                     "words": _words(name), "extra_words": _extra_words(extra)})
+    _apps_cache = apps
     return apps
 
 
@@ -598,18 +617,29 @@ def load_windows():
         return []
 
 
-def score(query, name, extra=""):
+_WORDS = re.compile(r"[\s\-_.]+")
+_EXTRA_WORDS = re.compile(r"[\s\-_.;,]+")
+
+
+def _words(name):
+    return _WORDS.split(name.lower())
+
+
+def _extra_words(extra):
+    return _EXTRA_WORDS.split(extra.lower())
+
+
+def score(query, name, extra="", words=None, extra_words=None):
     name = name.lower()
     total = 0
     for term in query.lower().split():
-        words = re.split(r"[\s\-_.]+", name)
         if name.startswith(term):
             s = 100
-        elif any(w.startswith(term) for w in words):
+        elif any(w.startswith(term) for w in (words if words is not None else _words(name))):
             s = 80
         elif term in name:
             s = 60
-        elif any(w.startswith(term) for w in re.split(r"[\s\-_.;,]+", extra)):
+        elif any(w.startswith(term) for w in (extra_words if extra_words is not None else _extra_words(extra))):
             s = 40
         elif len(term) > 2 and term in extra:
             s = 20
@@ -905,6 +935,7 @@ class Face(Gtk.DrawingArea):
         self.pokes = []
         self.tick = None
         self.last = None
+        self.drawn_at, self.drawn_mood = 0.0, None
         self.set_draw_func(self.draw)
         self.connect("map", self.on_map)
         self.connect("unmap", self.on_unmap)
@@ -953,7 +984,13 @@ class Face(Gtk.DrawingArea):
             want = (math.sin(t * 0.35) * 0.3, 0.0)
         for i in range(2):
             self.look[i] += (want[i] - self.look[i]) * min(1, dt * 8)
-        self.queue_draw()
+        # at rest he only breathes and glances around slowly: 30 fps is plenty and halves the cost;
+        # a poke, the pointer, a blink or a mood change gets every frame
+        calm = (abs(self.squish) < 0.002 and abs(self.squish_v) < 0.02 and px is None
+                and time.monotonic() < self.blink_at - 0.05 and self.drawn_mood == self.mood)
+        if not calm or t - self.drawn_at >= 1 / 31:
+            self.drawn_at, self.drawn_mood = t, self.mood
+            self.queue_draw()
         return True
 
     def draw(self, _area, cr, width, height):
@@ -1797,6 +1834,7 @@ class Guy:
         # Ask GUY
         self.items, self.view, self.mode_list = [], "idle", "search"
         self.claude_proc, self.claude_gen, self.answer_text = None, 0, ""
+        self.render_id, self.chat_stick = None, True
         self.file_gen = 0
         self.history, self.attachment, self.last_query = [], None, ""
 
@@ -1869,6 +1907,9 @@ class Guy:
         self.pacman = PacmanWatcher(self)
         self.prompts = PromptWatcher(self)
         self.media = MediaWatcher(self)
+        self.app_monitor = Gio.AppInfoMonitor.get()   # kept: the monitor only lives while referenced
+        self.app_monitor.connect("changed", _apps_changed)
+        GLib.idle_add(lambda: load_apps() and False)   # warm the cache so the first Alt+Space is quick
         GLib.timeout_add(1500, lambda: self.voice_send(status=True) and False)
         GLib.timeout_add_seconds(20, self.check_schedule)
         GLib.timeout_add_seconds(3, lambda: self.check_schedule() and False)
@@ -2009,14 +2050,18 @@ class Guy:
         self.spinner = Gtk.Spinner()
         head.append(self.spinner)
         self.answer_box.append(head)
-        self.answer_label = Gtk.Label(xalign=0, yalign=0, wrap=True, selectable=True,
-                                      wrap_mode=Pango.WrapMode.WORD_CHAR)
-        self.answer_label.add_css_class("answer")
-        self.answer_label.set_focusable(False)
-        answer_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
-                                           propagate_natural_height=True, max_content_height=420)
-        answer_scroll.set_child(self.answer_label)
-        self.answer_box.append(answer_scroll)
+        # the conversation so far: your questions as bubbles, GUY's answers under them; the last answer
+        # (self.answer_label) is the one that streams in
+        self.chat = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.chat.add_css_class("chat")
+        self.answer_label = None
+        self.chat_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                              propagate_natural_height=True, max_content_height=420)
+        self.chat_scroll.set_child(self.chat)
+        # keep the newest message in view as the answer grows
+        self.chat_scroll.get_vadjustment().connect("changed", self.chat_follow)
+        self.chat_scroll.get_vadjustment().connect("value-changed", self.chat_scrolled)
+        self.answer_box.append(self.chat_scroll)
         panel.append(self.answer_box)
 
         # GUY's assistant wants to do something risky: asked right here, above the footer
@@ -2092,8 +2137,8 @@ class Guy:
         return "idle"
 
     def apply(self):
-        self.refresh_pages()
         mode = self.compute_mode()
+        self.refresh_pages(mode)
         isl = self.island
         if mode != self.mode:
             prev, self.mode = self.mode, mode
@@ -2128,7 +2173,7 @@ class Guy:
             return max(170, min(460, nat))
         return WIDTHS[mode]
 
-    def refresh_pages(self):
+    def refresh_pages(self, mode):
         mood = self.mood()
         for f in self.faces:
             f.mood = mood
@@ -2168,7 +2213,13 @@ class Guy:
                                      + (f"   “{words}”" if words else ""))
         self.mic_button.set_visible(self.voice_wake is not None)
         self.mic_button.set_label("🎙  Hey GUY: on" if self.voice_wake else "🎙  Hey GUY: off")
-        # home
+        if mode == "home":
+            self.refresh_home()
+        self.refresh_approval()
+
+    def refresh_home(self):
+        """The overview's rows, rebuilt from scratch: only while it's on screen (apply() runs on every
+        download tick, pacman line and voice partial, and nobody sees these rows then)."""
         while (child := self.session_box.get_first_child()) is not None:
             self.session_box.remove(child)
         sessions = sorted(self.sessions.values(), key=lambda s: -s.updated)[:3]
@@ -2234,7 +2285,8 @@ class Guy:
             button.connect("clicked", lambda *_: self.run_update())
             noun = "update" if updates[0] == 1 else "updates"
             self.add_row(icon, f"{updates[0]} {noun} available", updates[1], None, None, None, button)
-        # approval (on the island, or in the Ask panel when that's open and it's GUY's own assistant asking)
+    def refresh_approval(self):
+        # on the island, or in the Ask panel when that's open and it's GUY's own assistant asking
         agent = self.agent_approval()
         self.ask_ap.set_visible(agent is not None and self.user_mode == "ask")
         if agent is not None:
@@ -2603,10 +2655,12 @@ class Guy:
         self.history = [(question, text)]
         self.ask_label = title
         self.answer_title.set_label(title)
+        self.chat_clear()
+        self.chat_add(None)
         self.answer_text = text
         self.render_answer()
         self.set_view("answer")
-        self.footer.set_label("Type a question about it and press Tab  ·  Ctrl+Shift+C copy  ·  Esc back")
+        self.footer.set_label("Type a question about it and press Enter  ·  Ctrl+Shift+C copy  ·  Esc back")
 
     # ----- reminders and routines -----
     def check_schedule(self):
@@ -3020,6 +3074,7 @@ class Guy:
                     self.icon_by_class.setdefault(a["wmclass"], a["icon"])
             self.history = []
             self.agent_session = None
+            self.chat_clear()
             self.entry.set_text("")
             self.set_attachment(None)
             self.show_items([])
@@ -3079,7 +3134,7 @@ class Guy:
         self.file_gen += 1
         text = self.entry.get_text()
         if self.view == "answer":
-            self.set_view("results" if text.strip() else "idle")
+            return                               # a follow-up: the chat stays, Enter sends it
         self.refresh(text)
 
     def refresh(self, text):
@@ -3105,7 +3160,8 @@ class Guy:
             if result is not None:
                 items.append({"kind": "calc", "title": result, "subtitle": f"{q}  ·  Enter to copy",
                               "icon": "accessories-calculator", "hint": "Copy", "value": result.replace(" ", "")})
-            apps = sorted(((score(q, a["name"], a["extra"]), a) for a in self.apps), key=lambda t: -t[0])
+            apps = sorted(((score(q, a["name"], a["extra"], a["words"], a["extra_words"]), a) for a in self.apps),
+                          key=lambda t: -t[0])
             for s, a in apps[:MAX_APPS]:
                 if s > 0:
                     items.append({"kind": "app", "title": a["name"], "subtitle": a["generic"],
@@ -3249,9 +3305,10 @@ class Guy:
         self.last_query = query or "What is this file? Summarise it briefly."
         label = self.ask_label = query or f"About {os.path.basename(self.attachment)}"
         self.answer_title.set_label(f"GUY  ·  {label}")
-        self.answer_label.set_text("")
+        self.chat_add(label)
         self.spinner.start()
         self.set_view("answer")
+        self.entry.set_text("")
 
         prompt = ""
         if self.history and not self.agent_session:
@@ -3321,14 +3378,15 @@ class Guy:
         """Claude went to use a tool: show what it's doing, and drop the "let me look" preamble."""
         if gen == self.claude_gen:
             self.answer_text = ""
-            self.answer_label.set_text("")
+            self.render_answer()
             self.answer_title.set_label(f"GUY  ·  {label}  ·  {TOOL_STATUS.get(name, 'working…')}")
         return False
 
     def claude_delta(self, gen, text):
         if gen == self.claude_gen:
             self.answer_text += text
-            self.render_answer()
+            if self.render_id is None:
+                self.render_id = GLib.timeout_add(50, self.render_answer)
         return False
 
     def claude_done(self, gen, error):
@@ -3358,12 +3416,50 @@ class Guy:
         return False
 
     def render_answer(self):
+        if self.render_id is not None:
+            GLib.source_remove(self.render_id)
+            self.render_id = None
+        if self.answer_label is None:
+            return False
         markup = md_to_markup(self.answer_text)
         try:
             Pango.parse_markup(markup, -1, "\0")
             self.answer_label.set_markup(markup)
         except GLib.Error:
             self.answer_label.set_text(self.answer_text)
+        return False
+
+    # ----- the chat transcript -----
+    def chat_clear(self):
+        while (child := self.chat.get_first_child()) is not None:
+            self.chat.remove(child)
+        self.answer_label = None
+        self.answer_text = ""
+
+    def chat_add(self, question):
+        """A new turn: your question as a bubble, and an empty answer under it that GUY fills in."""
+        if self.answer_label is not None and not self.answer_text:
+            self.chat.remove(self.answer_label)  # a stopped answer that never got a word
+        if question:
+            you = Gtk.Label(label=question, xalign=0, wrap=True, selectable=True, halign=Gtk.Align.END,
+                            wrap_mode=Pango.WrapMode.WORD_CHAR)
+            you.add_css_class("you")
+            you.set_focusable(False)
+            self.chat.append(you)
+        self.answer_label = Gtk.Label(xalign=0, yalign=0, wrap=True, selectable=True,
+                                      wrap_mode=Pango.WrapMode.WORD_CHAR)
+        self.answer_label.add_css_class("answer")
+        self.answer_label.set_focusable(False)
+        self.chat.append(self.answer_label)
+        self.answer_text = ""
+        self.chat_stick = True
+
+    def chat_follow(self, adj):
+        if self.chat_stick:
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+
+    def chat_scrolled(self, adj):
+        self.chat_stick = adj.get_value() >= adj.get_upper() - adj.get_page_size() - 24
 
     def stop_claude(self):
         proc, self.claude_proc = self.claude_proc, None
@@ -3383,7 +3479,8 @@ class Guy:
             if self.view == "answer":
                 self.stop_claude()
                 self.spinner.stop()
-                self.set_view("results" if self.items else "idle")
+                self.set_view("idle")
+                self.refresh(self.entry.get_text())
             else:
                 self.close_ask(explicit=True)
             return True
@@ -3411,7 +3508,7 @@ class Guy:
             elif self.view == "results":
                 row = self.listbox.get_selected_row()
                 self.activate_index(row.get_index() if row else 0)
-            elif self.attachment:
+            elif self.view == "answer" or self.attachment:
                 self.ask_claude(text)
             return True
         return False

@@ -18,6 +18,31 @@ Claude Code sessions show up live (what they're reading, editing and running). A
 request drops the island down with **Allow / Deny / Ask in terminal**. If GUY isn't running, or
 nobody clicks, the hook prints nothing and Claude Code asks in the terminal as usual.
 
+## Install
+
+Made for Arch Linux + Hyprland. Ask GUY needs [Claude Code](https://claude.com/claude-code) (`claude`).
+
+```sh
+git clone https://github.com/badudum/GUY.git
+cd GUY
+./install.sh              # add --no-voice to skip "Hey GUY" and its ~550 MB of speech models
+guy --install-hooks       # optional: show your Claude Code sessions on the island
+```
+
+The installer:
+
+1. installs the missing system packages with `pacman` (GTK 4, gtk4-layer-shell, wl-clipboard,
+   playerctl, PipeWire, fd, grim, wtype…), after asking for your password
+2. links `guy`, `guy-hook`, `guy-voice` and `guy-computer` into `~/.local/bin`
+3. sets up the voice: a venv in `~/.local/share/guy/venv` and the Vosk, Whisper and Piper models
+4. adds the systemd user services `guy` and `guy-voice`
+5. copies `hypr/guy.lua` (or `hypr/guy.conf` for a classic `hyprland.conf`) into `~/.config/hypr` and,
+   if you say yes, loads it from your config. It adds the blur, `Alt+Space`, `Super+Space`, and starts
+   GUY at login.
+
+You can run it again safely. To update: `git pull && systemctl --user restart guy guy-voice`.
+To remove it: `./install.sh --uninstall`.
+
 ## What GUY follows
 
 | Source | On the island |
@@ -72,10 +97,9 @@ the helper process (~480 MB with the models loaded), started at login next to `g
 - `guy`: the daemon (`guy`, `guy --ask`, `guy --install-hooks`, `guy --uninstall-hooks`)
 - `guy-hook`: the relay Claude Code runs; talks to `$XDG_RUNTIME_DIR/guy.sock`
 - `guy-voice`: listening and speaking (runs in `~/.local/share/guy/venv`); `$XDG_RUNTIME_DIR/guy-voice.sock`
-
-Both are symlinked into `~/.local/bin`. `~/.config/hypr/hyprland.lua` starts GUY at login
-(`hyde-Hyprland-guy.service`), blurs its layer (`guy` namespace) and binds `Alt+Space` to
-`guy --ask`. The old `spotlight` script is untouched; the backup is `hyprland.lua.bak-guy`.
+- `guy-computer`: screenshots, clicks and typing for GUY's assistant (needs `wtype`, and `wlrctl` from the AUR to click)
+- `install.sh`: the installer (see [Install](#install))
+- `hypr/`: Hyprland layer rules, key bindings and autostart, for the Lua and the classic config
 
 ## Claude Code hooks
 
