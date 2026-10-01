@@ -1194,7 +1194,9 @@ def island_path(cr, L, R, h, s, r, bulge, closed=True):
         cr.close_path()
 
 
-def draw_glass(cr, L, R, h, s, r, bulge):
+def draw_glass(cr, L, R, h, s, r, bulge, fast=False):
+    """fast: fewer, wider bands in the shadow and glow, for frames where the island is still moving
+    (about 3x quicker, and the difference doesn't show in motion)."""
     g = GLASS
 
     # drop shadow, outside the glass only, and faded out toward the bar so it doesn't smudge it
@@ -1208,7 +1210,7 @@ def draw_glass(cr, L, R, h, s, r, bulge):
     cr.push_group()
     cr.translate(0, g["shadow_offset"])
     cr.set_line_join(cairo.LINE_JOIN_ROUND)
-    steps = 13
+    steps = 5 if fast else 13
     # fades from the glass's own edge, so there's no flat band under it on light backgrounds
     start = 0.0
 
@@ -1247,9 +1249,10 @@ def draw_glass(cr, L, R, h, s, r, bulge):
         return g["glow_alpha"] * max(0.0, 1 - d / g["glow_range"]) ** g["glow_power"]
 
     cr.set_line_join(cairo.LINE_JOIN_ROUND)
-    for k in range(int(g["glow_range"]), 0, -1):
+    band = 3 if fast else 1
+    for k in range(int(g["glow_range"]), 0, -band):
         island_path(cr, L, R, h, s, r, bulge, closed=False)
-        cr.set_source_rgba(1, 1, 1, glow(k - 1) - glow(k))
+        cr.set_source_rgba(1, 1, 1, glow(max(0, k - band)) - glow(k))
         cr.set_line_width(2 * k)
         cr.stroke()
     cr.restore()
@@ -1273,6 +1276,10 @@ class Island(Gtk.Widget):
         self.alpha = 0.0
         self.follow = False      # the target height tracks the content's natural height
         self.on_target = None    # called when following changes the target
+        # the glass as last drawn: GTK re-snapshots the island whenever anything inside it redraws (the
+        # penguin, 30-60 times a second), and drawing the glass takes ~10 ms, so it's only redrawn
+        # when its shape changes
+        self.glass_key, self.glass_node = None, None
 
     def geometry(self):
         s = min(SHOULDER + min(abs(self.vw) * 0.006, 8), self.h / 2)
@@ -1306,9 +1313,16 @@ class Island(Gtk.Widget):
         s, r, bulge = self.geometry()
         L = self.get_width() / 2 - self.w / 2
         R = L + self.w
-        cr = snap.append_cairo(Graphene.Rect().init(L - s - SHADOW_PAD, 0, self.w + 2 * (s + SHADOW_PAD),
-                                                    self.h + bulge + SHADOW_PAD))
-        draw_glass(cr, L, R, self.h, s, r, bulge)
+        moving = abs(self.vw) > 0.5 or abs(self.vh) > 0.5
+        key = (L, R, self.h, s, r, bulge, moving)
+        if key != self.glass_key:
+            glass = Gtk.Snapshot()
+            cr = glass.append_cairo(Graphene.Rect().init(L - s - SHADOW_PAD, 0, self.w + 2 * (s + SHADOW_PAD),
+                                                         self.h + bulge + SHADOW_PAD))
+            draw_glass(cr, L, R, self.h, s, r, bulge, fast=moving)
+            del cr                             # finish the drawing before the node is taken
+            self.glass_key, self.glass_node = key, glass.to_node()
+        snap.append_node(self.glass_node)
         if self.alpha > 0.01 and self.content.get_visible():
             rr = Gsk.RoundedRect()
             zero, rad = Graphene.Size().init(0, 0), Graphene.Size().init(r, r)
@@ -1721,6 +1735,42 @@ def echo_off(tty_nr):
     return not (lflag & termios.ECHO) and bool(lflag & termios.ICANON)
 
 
+class ProcNames:
+    """Which processes are package tools or sudo, cheaply: each new pid's name is read twice (once
+    may catch it between fork and exec) and then remembered, so a poll costs a directory listing
+    and a few reads instead of parsing every /proc/*/stat (~12 ms)."""
+
+    WANTED = {(n + "\n").encode() for n in PKG_TOOLS + ("sudo",)}
+
+    def __init__(self):
+        self.names = {}            # pid -> (comm, confirmed)
+
+    def wanted(self):
+        names, seen, found = self.names, {}, False
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            old = names.get(d)
+            if old is not None and old[1]:
+                comm, sure = old[0], True
+            else:
+                try:
+                    fd = os.open(f"/proc/{d}/comm", os.O_RDONLY)
+                except OSError:
+                    continue
+                try:
+                    comm = os.read(fd, 64)
+                except OSError:
+                    comm = b""
+                finally:
+                    os.close(fd)
+                sure = old is not None and old[0] == comm
+            seen[d] = (comm, sure)
+            found = found or comm in self.WANTED
+        self.names = seen
+        return found
+
+
 class PromptWatcher:
     """Notices yay / pacman / sudo sitting at a terminal waiting for you. A password prompt turns the
     terminal's echo off; a question ([Y/n], a provider number, yay's menus) leaves the package tool in
@@ -1733,6 +1783,7 @@ class PromptWatcher:
         self.guy = guy
         self.last = None           # (tty, fg group, cpu) seen on the previous poll
         self.idle = 0
+        self.names = ProcNames()
         GLib.timeout_add(1500, self.poll)
 
     def cmdline(self, pid):
@@ -1761,6 +1812,10 @@ class PromptWatcher:
         return names[-1] if names else "sudo"
 
     def poll(self):
+        if not self.names.wanted():            # nothing that could be waiting at a terminal
+            self.last, self.idle = None, 0
+            self.guy.set_prompt(None)
+            return True
         procs = scan_procs()
         tools = [pid for pid, p in procs.items() if self.is_tool(pid, p, procs)]
         found = None

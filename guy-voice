@@ -20,6 +20,8 @@ if os.path.exists(VENV_PY) and sys.prefix != os.path.dirname(os.path.dirname(VEN
 #
 #   guy-voice    run in the background (started from ~/.config/hypr/hyprland.lua)
 
+import ctypes
+import gc
 import itertools
 import json
 import re
@@ -51,6 +53,7 @@ DANGLING = re.compile(r"\b(the|a|an|to|and|or|of|for|up|down|can|could|would|you
                       r"in|on|at|with|me|set|turn|open|play|put|make|about|like|then|but|so|if|it's|its)$")
 MAX_UTTERANCE = 150               # 15 s at most
 COOLDOWN = 1.5
+UNLOAD_AFTER = 600                # Whisper and Piper leave memory after 10 min unused (~300 MB); back in ~1-2 s
 STREAM_PROPS = '{ media.name = "GUY", application.name = "GUY" }'   # how the mic and voice show up in PipeWire
 # a few ordinary words around the wake phrase, so everyday speech doesn't get forced onto "hey guy"
 WAKE_GRAMMAR = ["hey guy", "hey", "guy", "guys", "hey guys", "hi", "okay", "by", "buy", "high", "the", "a", "i",
@@ -116,8 +119,6 @@ def blip(up=True):
 
 class Voice:
     def __init__(self):
-        from faster_whisper import WhisperModel
-        from piper import PiperVoice
         from vosk import KaldiRecognizer, Model, SetLogLevel
 
         SetLogLevel(-1)
@@ -125,9 +126,12 @@ class Voice:
         self.KaldiRecognizer = KaldiRecognizer
         self.wake_rec = KaldiRecognizer(self.vosk, RATE, json.dumps(WAKE_GRAMMAR))
         self.words_rec = KaldiRecognizer(self.vosk, RATE)    # full vocabulary: what you say, live
-        self.whisper = WhisperModel("base.en", device="cpu", compute_type="int8",
-                                    download_root=str(MODELS / "whisper"), cpu_threads=8)
-        self.piper = PiperVoice.load(str(MODELS / "piper/en_US-lessac-medium.onnx"))
+        # Whisper and Piper only matter for the few seconds you're talking to GUY: they load when you
+        # start talking (done before you've finished) and leave again after UNLOAD_AFTER unused
+        self.models_lock = threading.Lock()
+        self._whisper = self._piper = None
+        self.models_used = time.monotonic()
+        threading.Thread(target=self.unload_idle, daemon=True).start()
 
         self.hint = app_hint()
         self.lock = threading.Lock()
@@ -148,6 +152,48 @@ class Voice:
         self.heard_speech = 0
         self.quiet = 0
         self.after_wake = 0
+
+    # ----- models, loaded when needed -----
+    def whisper(self):
+        with self.models_lock:
+            if self._whisper is None:
+                from faster_whisper import WhisperModel
+                log("loading whisper")
+                self._whisper = WhisperModel("base.en", device="cpu", compute_type="int8",
+                                             download_root=str(MODELS / "whisper"), cpu_threads=8)
+            self.models_used = time.monotonic()
+            return self._whisper
+
+    def piper(self):
+        with self.models_lock:
+            if self._piper is None:
+                from piper import PiperVoice
+                log("loading piper")
+                self._piper = PiperVoice.load(str(MODELS / "piper/en_US-lessac-medium.onnx"))
+            self.models_used = time.monotonic()
+            return self._piper
+
+    def warm(self):
+        """You've started talking: get both ready in the background while you do."""
+        def load():
+            self.whisper()
+            self.piper()
+        threading.Thread(target=load, daemon=True).start()
+
+    def unload_idle(self):
+        while True:
+            time.sleep(60)
+            with self.models_lock:
+                idle = time.monotonic() - self.models_used > UNLOAD_AFTER
+                if not idle or (self._whisper is None and self._piper is None) or self.speaker is not None:
+                    continue
+                log("unloading whisper and piper")
+                self._whisper = self._piper = None
+            gc.collect()
+            try:                                   # hand the freed memory back to the system
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except (OSError, AttributeError):
+                pass
 
     # ----- settings -----
     def load_state(self):
@@ -275,6 +321,7 @@ class Voice:
         for chunk in preroll:                  # so "hey guy lower the…" in one breath is all there
             self.words_rec.AcceptWaveform(chunk)
         notify(event="listening")
+        self.warm()
         threading.Thread(target=blip, args=(True,), daemon=True).start()
 
     def finish(self, give_up=False):
@@ -293,7 +340,7 @@ class Voice:
     def transcribe(self, audio):
         samples = np.frombuffer(audio, np.int16).astype(np.float32) / 32768
         try:
-            segments, _ = self.whisper.transcribe(samples, beam_size=1, language="en", vad_filter=True,
+            segments, _ = self.whisper().transcribe(samples, beam_size=1, language="en", vad_filter=True,
                                                   condition_on_previous_text=False, initial_prompt=self.hint)
             text = " ".join(s.text for s in segments).strip()
         except Exception as e:  # noqa: BLE001 - report it rather than dying
@@ -319,7 +366,7 @@ class Voice:
         log("say:", repr(text[:60]), "(then listen)" if follow else "")
         self.stop_speaking()
         try:
-            chunks = self.piper.synthesize(text)
+            chunks = self.piper().synthesize(text)
             first = next(iter(chunks), None)
         except Exception:  # noqa: BLE001
             return
