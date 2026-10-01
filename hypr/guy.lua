@@ -8,6 +8,8 @@ hl.layer_rule({
 	blur = true,
 	ignore_alpha = 0.5,
 	no_anim = true,
+	-- above every other overlay (orbit's desktop cube, notifications), so a pulled-out GUY floats on top
+	order = 100,
 })
 -- the invisible click-catcher behind Ask GUY: no blur, no animation
 hl.layer_rule({

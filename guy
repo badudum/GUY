@@ -16,7 +16,7 @@ def _send(message, sock="guy.sock"):
 
 # Alt+Space fast path: a running GUY takes "--ask" over its socket, skipping the ~270 ms of loading
 # GTK just to forward one command. Falls through to the normal start when GUY isn't running.
-if sys.argv[1:] in (["--ask"], ["--home"]):
+if sys.argv[1:] in (["--ask"], ["--home"], ["--float"]):
     try:
         _send({"guy_command": sys.argv[1][2:]})
         sys.exit(0)
@@ -234,6 +234,7 @@ except (ValueError, ImportError):
     DesktopAppInfo = Gio.DesktopAppInfo
 
 HOME = Path.home()
+FLOAT_STATE = HOME / ".local/state/guy/float.json"
 SOCK = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "guy.sock"
 
 # the layer surface never resizes; the island is drawn inside it and the input region follows it
@@ -360,6 +361,9 @@ window.guy, window.guy.background, window.guy-catcher, window.guy-catcher.backgr
 .slast { font-size: 12.5px; color: rgba(255, 255, 255, 0.68); }
 .sage { font-size: 11px; color: rgba(255, 255, 255, 0.40); }
 .session.clickable:hover { background: rgba(255, 255, 255, 0.11); }
+.session .more .link-row { background: none; border: none; box-shadow: none; padding: 3px 6px; margin-left: -6px;
+                          border-radius: 8px; font-weight: normal; }
+.session .more .link-row:hover { background: rgba(255, 255, 255, 0.10); }
 .session .more { padding: 2px 0 4px 40px; font-size: 12.5px; color: rgba(255, 255, 255, 0.80); }
 .aicon { color: rgba(255, 255, 255, 0.75); }
 .session progressbar trough { min-height: 3px; border-radius: 99px; background: rgba(255, 255, 255, 0.10); border: none; }
@@ -1194,16 +1198,168 @@ def island_path(cr, L, R, h, s, r, bulge, closed=True):
         cr.close_path()
 
 
-def draw_glass(cr, L, R, h, s, r, bulge, fast=False):
-    """fast: fewer, wider bands in the shadow and glow, for frames where the island is still moving
-    (about 3x quicker, and the difference doesn't show in motion)."""
-    g = GLASS
+def float_path(cr, x, y, w, h, r, closed=True):
+    """A free-floating piece of glass: the same squircle corners on all four sides (an orb when it's square
+    and r is half its size)."""
+    r = max(0.0, min(r, w / 2, h / 2))
+    cr.new_sub_path()
+    if r >= min(w, h) / 2 - 0.01:                # an orb (or a pill): round, like a drop
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, math.pi * 1.5)
+        cr.close_path()
+        return
+    squircle_corner(cr, x + r, y + r, r, math.pi, math.pi * 1.5)
+    squircle_corner(cr, x + w - r, y + r, r, -math.pi / 2, 0)
+    squircle_corner(cr, x + w - r, y + h - r, r, 0, math.pi / 2)
+    squircle_corner(cr, x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.close_path()
 
-    # drop shadow, outside the glass only, and faded out toward the bar so it doesn't smudge it
+
+def goo_path(cr, L, R, h, s, r, ox, oy, ow, oh, nw, closed=True):
+    """The island and a drop of it on a neck, as one outline: what you see while pulling GUY out or
+    while he's being drawn back in. (ox, oy) is the drop's top centre, nw how thick the neck is."""
+    rr = min(ow, oh) / 2
+    cx = max(L + r + nw / 2, min(R - r - nw / 2, ox))
+    mid = max(oy + oh / 2, h + 3)               # never above the island's edge: the outline would cross itself
+    span = max(1.0, mid - h)
+    cr.move_to(L - s, 0)
+    cr.arc(L - s, s, s, -math.pi / 2, 0)
+    cr.line_to(L, h - r)
+    squircle_corner(cr, L + r, h - r, r, math.pi, math.pi / 2)
+    cr.line_to(cx - nw / 2, h)
+    cr.curve_to(cx - nw / 2, h + span * 0.45, ox - rr, mid - span * 0.45, ox - rr, mid)
+    cr.arc_negative(ox, mid, rr, math.pi, 0)     # round underneath, like a drop
+    cr.curve_to(ox + rr, mid - span * 0.45, cx + nw / 2, h + span * 0.45, cx + nw / 2, h)
+    cr.line_to(R - r, h)
+    squircle_corner(cr, R - r, h - r, r, math.pi / 2, 0)
+    cr.line_to(R, s)
+    cr.arc(R + s, s, s, math.pi, math.pi * 1.5)
+    if closed:
+        cr.close_path()
+
+
+CONTACT = 0.2                     # how far along a bridge (0..1) the two bodies touch
+
+
+def bridge_path(cr, x, y, w, h, r, b, closed=True):
+    """Floating glass (x, y, w, h, corner r) being taken back by the top edge, as liquid, b from 0 to 1.
+    Before they touch (b < CONTACT) both reach for each other: a droplet sags from the edge and the glass's
+    top swells into a mound. They meet in the middle and a thin neck pinches in, waisted like an
+    hourglass, with wide feet where it meets each surface; the waist widens, the feet spread across the
+    top, the top corners melt away, and at b = 1 (with y = 0) it is the docked island exactly: the edge's
+    shoulders running into its sides."""
+    cx = x + w / 2
+    S = SHOULDER
+
+    def smooth(t):
+        t = max(0.0, min(1.0, t))
+        return t * t * (3 - 2 * t)
+
+    q = smooth(b / CONTACT)                      # reaching, before contact
+    m = smooth((b - CONTACT) / (1 - CONTACT)) if b > CONTACT else 0.0   # merging, after
+    rt = r * (1 - m)                             # its top corners, melting
+    rb = r + (min(RADIUS, h / 2, w / 2) - r) * m ** 4   # its bottom corners: still a drop until the very end
+    round_ = r >= min(w, h) / 2 - 0.01          # an orb keeps round corners while its radius eases
+
+    def corner(ccx, ccy, rad, t0, t1):
+        if rad <= 0.01:
+            cr.line_to(ccx + math.cos(t1) * rad, ccy + math.sin(t1) * rad)
+        elif round_:
+            (cr.arc if t1 > t0 else cr.arc_negative)(ccx, ccy, rad, t0, t1)
+        else:
+            squircle_corner(cr, ccx, ccy, rad, t0, t1)
+
+    def body(top_left_to, top_right_from):
+        """The glass below its top edge: from the top-left corner round to the top-right corner."""
+        top_left_to()
+        if rt > 0.01:
+            cr.arc_negative(x + rt, y + rt, rt, -math.pi / 2, -math.pi)
+        cr.line_to(x, y + h - rb)
+        corner(x + rb, y + h - rb, rb, math.pi, math.pi / 2)
+        cr.line_to(x + w - rb, y + h)
+        corner(x + w - rb, y + h - rb, rb, math.pi / 2, 0)
+        cr.line_to(x + w, y + rt)
+        if rt > 0.01:
+            cr.arc_negative(x + w - rt, y + rt, rt, 0, -math.pi / 2)
+        top_right_from()
+
+    if b < CONTACT:
+        # a flat top swells up into a mound to meet the droplet; a round one (the orb) can't, so the
+        # droplet reaches all the way down to it instead
+        mound = (w / 2 - rt) >= 14
+        # the edge's droplet, sagging toward it
+        depth = y * (0.5 if mound else 1.0) * q
+        dw = 12 + 18 * q
+        if depth > 0.5:
+            cr.move_to(cx - dw - S * q, 0)
+            cr.curve_to(cx - dw * 0.7, 0, cx - dw * 0.62, depth, cx, depth)     # a round bottom, like a drop
+            cr.curve_to(cx + dw * 0.62, depth, cx + dw * 0.7, 0, cx + dw + S * q, 0)
+            if closed:
+                cr.close_path()
+        # the glass, its top swelling up to meet it
+        rise = y * 0.5 * q if mound else 0.0
+        mw = min(w / 2 - rt, 14 + 18 * q) if mound else 0.0
+        cr.new_sub_path()
+        cr.move_to(cx, y - rise)
+
+        def left():
+            if mw > 0.5:
+                cr.curve_to(cx - mw * 0.62, y - rise, cx - mw * 0.7, y, cx - mw, y)
+            cr.line_to(x + rt, y)
+
+        def right():
+            cr.line_to(cx + mw, y)
+            if mw > 0.5:
+                cr.curve_to(cx + mw * 0.7, y, cx + mw * 0.62, y - rise, cx, y - rise)
+
+        body(left, right)
+        cr.close_path()
+        return
+
+    # joined: an hourglass neck from the edge to the glass
+    ww = min(w - 2 * rt, 6 + (w - 6) * m ** 1.6)            # the waist
+    ym = max(S * m, y * 0.5 * (1 - m) + min(y, S) * m)      # its height
+    st = min(ww / 2 + S + 18 * (1 - m), w / 2 + S + 18)     # the foot on the edge
+    sp = min(ww / 2 + 20 * (1 - m), w / 2 - rt)             # the foot on the glass
+    cr.move_to(cx - st, 0)
+    cr.curve_to(cx - st + (st - ww / 2) * 0.55, 0, cx - ww / 2, ym * 0.45, cx - ww / 2, ym)
+
+    def left():
+        if y > ym + 0.5:
+            cr.curve_to(cx - ww / 2, ym + (y - ym) * 0.55, cx - sp + (sp - ww / 2) * 0.55, y, cx - sp, y)
+            cr.line_to(x + rt, y)
+        else:                                    # the glass's top is up inside the neck: straight down its side
+            cr.line_to(x, max(ym, y + rt))
+
+    def right():
+        if y > ym + 0.5:
+            cr.line_to(cx + sp, y)
+            cr.curve_to(cx + sp - (sp - ww / 2) * 0.55, y, cx + ww / 2, ym + (y - ym) * 0.55, cx + ww / 2, ym)
+        else:
+            cr.line_to(cx + ww / 2, ym)
+
+    body(left, right)
+    cr.curve_to(cx + ww / 2, ym * 0.45, cx + st - (st - ww / 2) * 0.55, 0, cx + st, 0)
+    if closed:
+        cr.close_path()
+
+
+def draw_glass(cr, path, bbox, fade=None, fast=False, ring=0.0):
+    """The glass along `path` (a function drawing the outline: path(cr, closed)), inside `bbox`
+    (x, y, w, h). fade: fade the shadow out toward the top edge over that many pixels (glass hanging
+    from the edge); None for glass floating free. fast: fewer, wider bands in the shadow and glow, for
+    frames where it's moving (about 2x quicker, and the difference doesn't show in motion). ring: a
+    brighter rim, for a floating GUY that has the keyboard."""
+    g = GLASS
+    bx, by, bw, bh = bbox
+
+    # drop shadow, outside the glass only
     cr.save()
-    pad = g["shadow_range"] + s + 4
-    cr.rectangle(L - pad, 0, (R - L) + 2 * pad, h + bulge + g["shadow_offset"] + g["shadow_range"] + 4)
-    island_path(cr, L, R, h, s, r, bulge)
+    pad = g["shadow_range"] + 4
+    cr.rectangle(bx - pad, by - pad, bw + 2 * pad, bh + 2 * pad + g["shadow_offset"])
+    path(cr, True)
     cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
     cr.clip()
     cr.set_fill_rule(cairo.FILL_RULE_WINDING)
@@ -1211,38 +1367,39 @@ def draw_glass(cr, L, R, h, s, r, bulge, fast=False):
     cr.translate(0, g["shadow_offset"])
     cr.set_line_join(cairo.LINE_JOIN_ROUND)
     steps = 5 if fast else 13
-    # fades from the glass's own edge, so there's no flat band under it on light backgrounds
-    start = 0.0
 
     def shade(d):
         return g["shadow_alpha"] * max(0.0, 1 - d / g["shadow_range"]) ** g["shadow_power"]
 
-    island_path(cr, L, R, h, s, r, bulge)
-    cr.set_source_rgba(0, 0, 0, shade(start))
+    path(cr, True)
+    cr.set_source_rgba(0, 0, 0, shade(0))
     cr.fill()
-    step = (g["shadow_range"] - start) / steps
+    step = g["shadow_range"] / steps
     for k in range(1, steps + 1):
-        d = start + step * k
-        island_path(cr, L, R, h, s, r, bulge)
+        d = step * k
+        path(cr, True)
         cr.set_source_rgba(0, 0, 0, shade(d - step) - shade(d))
-        d -= start
         cr.set_line_width(2 * d)
         cr.stroke()
     cr.pop_group_to_source()
-    fade = cairo.LinearGradient(0, 0, 0, max(h * 0.8, 24))
-    fade.add_color_stop_rgba(0, 0, 0, 0, 0)
-    fade.add_color_stop_rgba(1, 0, 0, 0, 1)
-    cr.mask(fade)
+    if fade:
+        # hanging from the top edge: faded out toward the bar so it doesn't smudge it
+        grad = cairo.LinearGradient(0, 0, 0, max(fade, 24))
+        grad.add_color_stop_rgba(0, 0, 0, 0, 0)
+        grad.add_color_stop_rgba(1, 0, 0, 0, 1)
+        cr.mask(grad)
+    else:
+        cr.paint()
     cr.restore()
 
     # the glass itself: the terminal's background colour at the terminal's opacity, blurred by Hyprland
-    island_path(cr, L, R, h, s, r, bulge)
+    path(cr, True)
     cr.set_source_rgba(*g["fill"])
     cr.fill()
 
     # inner glow: white at the rim fading to nothing, the same falloff as the terminal's lit edge
     cr.save()
-    island_path(cr, L, R, h, s, r, bulge)
+    path(cr, True)
     cr.clip()
 
     def glow(d):
@@ -1251,20 +1408,29 @@ def draw_glass(cr, L, R, h, s, r, bulge, fast=False):
     cr.set_line_join(cairo.LINE_JOIN_ROUND)
     band = 3 if fast else 1
     for k in range(int(g["glow_range"]), 0, -band):
-        island_path(cr, L, R, h, s, r, bulge, closed=False)
+        path(cr, False)
         cr.set_source_rgba(1, 1, 1, glow(max(0, k - band)) - glow(k))
         cr.set_line_width(2 * k)
         cr.stroke()
     cr.restore()
 
     # the 1px rim, even all the way round
-    island_path(cr, L, R, h, s, r, bulge, closed=False)
-    cr.set_source_rgba(1, 1, 1, g["rim_alpha"])
-    cr.set_line_width(1.0)
+    path(cr, False)
+    cr.set_source_rgba(1, 1, 1, g["rim_alpha"] + 0.36 * ring)
+    cr.set_line_width(1.0 + ring)
     cr.stroke()
 
 
+ORB = 64                          # a floating GUY, pulled out of the island
+NECK_LEN = 150                    # how far a drop stretches on its neck before it snaps off
+NECK_W = 46                       # the neck's thickness where it leaves the island
+
+
 class Island(Gtk.Widget):
+    """All of GUY's glass. It fills the screen (click-through outside the glass) so it can be anywhere:
+    hanging from the top edge (w, h, the "dock"), floating free (fx, fy, fw, fh: centre x, top, size),
+    or both at once, joined by a neck, while he's pulled out or drawn back in. The pages are shown
+    in whichever one is home (`floating`)."""
     __gtype_name__ = "GuyIsland"
 
     def __init__(self, content):
@@ -1273,60 +1439,206 @@ class Island(Gtk.Widget):
         content.set_parent(self)
         self.w, self.h, self.vw, self.vh = float(HIDDEN_W), 0.0, 0.0, 0.0
         self.tw, self.th = float(HIDDEN_W), 0.0
+        # the floating glass and where it's heading
+        self.fx = self.fy = self.fw = self.fh = 0.0
+        self.vfx = self.vfy = self.vfw = self.vfh = 0.0
+        self.tfx = self.tfy = self.tfw = self.tfh = 0.0
+        self.fvis = False        # there is floating glass
+        self.floating = False    # the pages live in the floating glass
+        self.goo = 0.0           # how joined the two are (the neck), 0..1
+        self.bridge = 0.0        # the floating glass caught by the top edge, 0..1 (see bridge_path)
+        self.ring = 0.0          # brighter rim: the floating GUY has the keyboard
+        # taffy: an open panel being pulled down stretches (the dock's glass scaled from the top edge)
+        self.sx = self.sy = 1.0
+        self.vsx = self.vsy = 0.0
+        self.stretching = False  # the pointer holds the stretch; when False it springs back to 1
         self.alpha = 0.0
         self.follow = False      # the target height tracks the content's natural height
         self.on_target = None    # called when following changes the target
-        # the glass as last drawn: GTK re-snapshots the island whenever anything inside it redraws (the
-        # penguin, 30-60 times a second), and drawing the glass takes ~10 ms, so it's only redrawn
-        # when its shape changes
-        self.glass_key, self.glass_node = None, None
+        # the glass as last drawn, one render node per piece: GTK re-snapshots the island whenever anything
+        # inside it redraws (the penguin, 30-60 times a second), and drawing a panel's glass takes 10-18 ms,
+        # so each piece is drawn at the origin, cached by its shape, and only moved (or, for small changes
+        # of size like a wobble or a stretch, scaled) from frame to frame
+        self.nodes = {}
+        self.animating = False   # the springs are running: the quick glass; full quality once they stop
 
     def geometry(self):
         s = min(SHOULDER + min(abs(self.vw) * 0.006, 8), self.h / 2)
         r = max(0.0, min(RADIUS, self.h / 2, self.w / 2))
         # it drips a little as it grows; going away it just retracts, straight up
-        bulge = min(self.vh * 0.012, BULGE_MAX) if self.h > 8 and self.vh > 0 else 0.0
+        bulge = min(self.vh * 0.012, BULGE_MAX) if self.h > 8 and self.vh > 0 and not self.fvis else 0.0
         return s, r, bulge
 
+    def float_rect(self):
+        return self.fx - self.fw / 2, self.fy, self.fw, self.fh
+
+    def float_radius(self):
+        return min(self.fw, self.fh) / 2 if max(self.fw, self.fh) <= ORB + 4 else RADIUS
+
+    def neck(self):
+        """How thick the neck between the island and the drop is right now (0: not joined)."""
+        if self.goo <= 0.01 or not self.fvis or self.h < 2 or max(self.fw, self.fh) > ORB * 1.6:
+            return 0.0                           # only a drop hangs on a neck, not a whole panel
+        gap = self.fy - self.h
+        if gap > NECK_LEN:
+            return 0.0
+        return max(0.0, NECK_W * self.goo * (1 - max(0.0, gap) / NECK_LEN) ** 0.8)
+
+    def primary(self):
+        """(w, h, target w, target h) of the glass the pages live in."""
+        if self.floating:
+            return self.fw, self.fh, self.tfw, self.tfh
+        return self.w, self.h, self.tw, self.th
+
     def do_measure(self, orientation, _for_size):
-        n = SURF_W if orientation == Gtk.Orientation.HORIZONTAL else SURF_H
-        return n, n, -1, -1
+        return 0, 0, -1, -1
 
     def page_height(self, widget, width):
-        return min(widget.measure(Gtk.Orientation.VERTICAL, int(width))[1], SURF_H - SHADOW_PAD)
+        return min(widget.measure(Gtk.Orientation.VERTICAL, int(width))[1],
+                   max(200, (self.get_height() or SURF_H) - 2 * SHADOW_PAD))
 
     def do_size_allocate(self, width, _height, _baseline):
         if not self.content.get_visible():
             return
-        tw = int(self.tw)
+        tw = int(self.tfw if self.floating else self.tw)
+        tw = max(tw, self.content.measure(Gtk.Orientation.HORIZONTAL, -1)[0])   # shrinking past the page: it just clips
         ch = self.page_height(self.content, tw)
-        if self.follow and abs(ch - self.th) > 0.5:
-            self.th = float(ch)
+        target = self.tfh if self.floating else self.th
+        if self.follow and abs(ch - target) > 0.5:
+            if self.floating:
+                self.tfh = float(ch)
+            else:
+                self.th = float(ch)
             if self.on_target:
                 GLib.idle_add(self.on_target)
-        t = Gsk.Transform.new().translate(Graphene.Point().init((width - tw) / 2, 0))
-        self.content.allocate(tw, ch, -1, t)
+        if self.floating:
+            x, y = self.snap(self.fx - tw / 2), self.snap(self.fy)   # whole pixels: text doesn't shimmer as it moves
+        else:
+            x, y = (width - tw) / 2, 0
+        self.content.allocate(tw, ch, -1, Gsk.Transform.new().translate(Graphene.Point().init(x, y)))
+
+    def cached(self, role, key, bounds, draw):
+        """The render node for one piece of glass: drawn by draw(cr) within bounds, or reused. It's a
+        texture, not a cairo node: GTK uploads a cairo node to the GPU again on every frame (several MB
+        for a panel, the difference between a smooth drag and 30 fps), a texture once."""
+        old = self.nodes.get(role)
+        if old and old[0] == key:
+            return old[1]
+        scale = self.scale()
+        # on the screen's pixel grid (the screen is at a fractional scale): a texture between pixels is
+        # resampled differently on every frame it moves, and its 1px rim shimmers
+        x0, y0 = math.floor(bounds[0] * scale), math.floor(bounds[1] * scale)
+        x1, y1 = math.ceil((bounds[0] + bounds[2]) * scale), math.ceil((bounds[1] + bounds[3]) * scale)
+        bx, by = x0 / scale, y0 / scale
+        pw, ph = max(1, x1 - x0), max(1, y1 - y0)
+        img = cairo.ImageSurface(cairo.FORMAT_ARGB32, pw, ph)
+        img.set_device_scale(scale, scale)
+        cr = cairo.Context(img)
+        cr.translate(-bx, -by)
+        draw(cr)
+        del cr
+        img.flush()
+        texture = Gdk.MemoryTexture.new(pw, ph, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+                                        GLib.Bytes.new(bytes(img.get_data())), img.get_stride())
+        glass = Gtk.Snapshot()
+        glass.append_texture(texture, Graphene.Rect().init(bx, by, pw / scale, ph / scale))
+        node = glass.to_node()
+        self.nodes[role] = (key, node)
+        return node
+
+    def scale(self):
+        native = self.get_native()
+        surface = native.get_surface() if native else None
+        return surface.get_scale() if surface is not None else 1.0
+
+    def snap(self, v):
+        """v, on a whole screen pixel."""
+        sc = self.scale()
+        return round(v * sc) / sc
+
+    @staticmethod
+    def near_scale(cur, target):
+        return target > 1 and 0.6 <= cur / target <= 1.5
 
     def do_snapshot(self, snap):
-        if self.h < 0.5:
+        W = self.get_width()
+        dock = self.h >= 0.5
+        if not dock and not self.fvis:
             return
         s, r, bulge = self.geometry()
-        L = self.get_width() / 2 - self.w / 2
+        L = W / 2 - self.w / 2
         R = L + self.w
-        moving = abs(self.vw) > 0.5 or abs(self.vh) > 0.5
-        key = (L, R, self.h, s, r, bulge, moving)
-        if key != self.glass_key:
-            glass = Gtk.Snapshot()
-            cr = glass.append_cairo(Graphene.Rect().init(L - s - SHADOW_PAD, 0, self.w + 2 * (s + SHADOW_PAD),
-                                                         self.h + bulge + SHADOW_PAD))
-            draw_glass(cr, L, R, self.h, s, r, bulge, fast=moving)
-            del cr                             # finish the drawing before the node is taken
-            self.glass_key, self.glass_node = key, glass.to_node()
-        snap.append_node(self.glass_node)
+        fx, fy, fw, fh = self.float_rect()
+        fr = self.float_radius()
+        nw = self.neck() if dock else 0.0
+        P = SHADOW_PAD
+        moving = self.animating    # not from speeds: flipping on a threshold mid-drag made the glass flicker
+        if nw > 0.5:
+            # joined by a neck (a small drop, pulled out or coming home): one outline, drawn as it is
+            top = max(self.h + bulge, fy + fh)
+            x0, x1 = min(L - s, fx), max(R + s, fx + fw)
+            key = (L, R, self.h, s, r, self.fx, fy, fw, fh, nw)
+            node = self.cached("goo", key, (x0 - P, -P, x1 - x0 + 2 * P, top + 2 * P), lambda cr: draw_glass(
+                cr, lambda c, closed: goo_path(c, L, R, self.h, s, r, self.fx, fy, fw, fh, nw, closed),
+                (L - s, 0, R - L + 2 * s, fy + fh), fade=self.h * 0.8, fast=True))
+            snap.append_node(node)
+        else:
+            if dock:
+                # drawn at x = 0 and moved into place; a stretch scales it from the middle of the top edge
+                w, h = self.w, self.h
+                key = (round(w, 1), round(h, 1), round(s, 1), round(r, 1), round(bulge, 1), moving)
+                node = self.cached("dock", key, (-s - P, 0, w + 2 * (s + P), h + bulge + P), lambda cr: draw_glass(
+                    cr, lambda c, closed: island_path(c, 0, w, h, s, r, bulge, closed),
+                    (-s, 0, w + 2 * s, h + bulge), fade=h * 0.8, fast=moving))
+                snap.save()
+                if self.sx != 1.0 or self.sy != 1.0:
+                    snap.translate(Graphene.Point().init(W / 2, 0))
+                    snap.scale(self.sx, self.sy)
+                    snap.translate(Graphene.Point().init(-w / 2, 0))
+                else:
+                    snap.translate(Graphene.Point().init(self.snap(W / 2 - w / 2), 0))
+                snap.append_node(node)
+                snap.restore()
+            if self.fvis and fw > 1 and fh > 1 and self.bridge > 0.005:
+                # caught by the top edge: drawn as it is, every frame (only for the moment it attaches)
+                b = round(self.bridge, 3)
+                key = (round(fx, 1), round(fy, 1), round(fw, 1), round(fh, 1), round(fr, 1), b)
+                x0, x1 = fx - SHOULDER, fx + fw + SHOULDER
+                node = self.cached("bridge", key, (x0 - P, -P, x1 - x0 + 2 * P, fy + fh + 2 * P + 10),
+                                   lambda cr: draw_glass(cr, lambda c, closed: bridge_path(c, fx, fy, fw, fh, fr, b, closed),
+                                                         (x0, 0, x1 - x0, fy + fh), fade=(fy + fh) * 0.8 * b or None,
+                                                         fast=True, ring=self.ring * (1 - b)))
+                snap.append_node(node)
+            elif self.fvis and fw > 1 and fh > 1:
+                # close to its target size (a wobble, a stretch letting go): the target's glass, scaled;
+                # far from it (opening out of the orb): drawn at the size it is
+                if self.near_scale(fw, self.tfw) and self.near_scale(fh, self.tfh) and fr != min(fw, fh) / 2:
+                    gw, gh = self.tfw, self.tfh
+                elif self.near_scale(fw, self.tfw) and self.near_scale(fh, self.tfh) and self.tfw == self.tfh:
+                    gw, gh = self.tfw, self.tfh          # an orb wobbling: still an orb, scaled
+                else:
+                    gw, gh = round(fw, 1), round(fh, 1)
+                gr = min(gw, gh) / 2 if max(gw, gh) <= ORB + 4 else RADIUS
+                key = (gw, gh, gr, round(self.ring, 2), moving)
+                node = self.cached("float", key, (-P, -P, gw + 2 * P, gh + 2 * P + GLASS["shadow_offset"]),
+                                   lambda cr: draw_glass(cr, lambda c, _closed: float_path(c, 0, 0, gw, gh, gr),
+                                                         (0, 0, gw, gh), fast=key[-1], ring=self.ring))
+                snap.save()
+                snap.translate(Graphene.Point().init(self.snap(fx), self.snap(fy)))
+                if (gw, gh) != (fw, fh):
+                    snap.scale(fw / gw, fh / gh)
+                snap.append_node(node)
+                snap.restore()
         if self.alpha > 0.01 and self.content.get_visible():
             rr = Gsk.RoundedRect()
-            zero, rad = Graphene.Size().init(0, 0), Graphene.Size().init(r, r)
-            rr.init(Graphene.Rect().init(L, 0, self.w, self.h), zero, zero, rad, rad)
+            zero = Graphene.Size().init(0, 0)
+            if self.floating:
+                rad = Graphene.Size().init(fr, fr)
+                rr.init(Graphene.Rect().init(fx, fy, fw, fh), rad, rad, rad, rad)
+            else:
+                rad = Graphene.Size().init(r, r)
+                cw, ch = self.w * self.sx, self.h * self.sy
+                rr.init(Graphene.Rect().init(W / 2 - cw / 2, 0, cw, ch), zero, zero, rad, rad)
             snap.push_rounded_clip(rr)
             snap.push_opacity(self.alpha)
             snap.save()
@@ -1735,6 +2047,289 @@ def echo_off(tty_nr):
     return not (lflag & termios.ECHO) and bool(lflag & termios.ICANON)
 
 
+# ---------- news headlines, for the overview ----------
+NEWS_CONFIG = Path.home() / ".config/guy/news.json"
+NEWS_FEEDS = ["https://www.cbc.ca/webfeed/rss/rss-topstories", "https://feeds.bbci.co.uk/news/world/rss.xml"]
+NEWS_EVERY = 1800                 # seconds between fetches
+NEWS_COUNT = 6
+
+
+def parse_feed(data, source):
+    """Headlines from an RSS or Atom feed: [(published, title, link, source)]."""
+    import email.utils
+    import xml.etree.ElementTree as ET
+    out = []
+    root = ET.fromstring(data)
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag not in ("item", "entry"):
+            continue
+        fields = {c.tag.rsplit("}", 1)[-1]: c for c in el}
+        title = (fields["title"].text or "").strip() if "title" in fields else ""
+        link = fields.get("link")
+        link = ((link.text or "").strip() or link.get("href", "")) if link is not None else ""
+        when = 0.0
+        for k in ("pubDate", "published", "updated"):
+            if k in fields and fields[k].text:
+                try:
+                    when = email.utils.parsedate_to_datetime(fields[k].text).timestamp()
+                except (TypeError, ValueError):
+                    try:
+                        import datetime as dt
+                        when = dt.datetime.fromisoformat(fields[k].text.strip().replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        pass
+                break
+        if title and link:
+            out.append((when, title, link, source))
+    return out
+
+
+class NewsWatcher:
+    """The latest headlines from a few RSS feeds (CBC and BBC World unless ~/.config/guy/news.json says
+    {"feeds": [...], "count": 6}), fetched every half hour in the background and when the overview
+    opens on stale ones. Nothing is fetched with news switched off ({"feeds": []})."""
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.items = []            # [(published, title, link, source)], newest first
+        self.fetched = 0.0
+        self.busy = False
+        GLib.timeout_add_seconds(15, lambda: self.refresh() and False)
+        GLib.timeout_add_seconds(NEWS_EVERY, self.refresh)
+
+    @staticmethod
+    def config():
+        try:
+            cfg = json.loads(NEWS_CONFIG.read_text())
+        except (OSError, ValueError):
+            cfg = {}
+        return list(cfg.get("feeds", NEWS_FEEDS)), int(cfg.get("count", NEWS_COUNT))
+
+    def stale(self):
+        return time.time() - self.fetched > NEWS_EVERY
+
+    def refresh(self):
+        if self.busy:
+            return True
+        feeds, count = self.config()
+        if not feeds:
+            self.items = []
+            return True
+        self.busy = True
+
+        def work():
+            import urllib.request
+            items = []
+            for url in feeds:
+                source = urllib.parse.urlparse(url).hostname or url
+                source = re.sub(r"^(www|feeds|rss)\.", "", source).split(".")[0]
+                source = {"bbci": "BBC", "theguardian": "Guardian"}.get(source, source.upper())
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "GUY/1.0"})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        items += parse_feed(r.read(), source)
+                except Exception:  # noqa: BLE001 - a feed that's down just doesn't show
+                    continue
+            GLib.idle_add(self.got, items, count)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def got(self, items, count):
+        self.busy = False
+        if items:                              # offline: keep the old headlines rather than none
+            seen, fresh = set(), []
+            for it in sorted(items, key=lambda i: -i[0]):
+                k = it[1].lower()
+                if k not in seen:
+                    seen.add(k)
+                    fresh.append(it)
+            self.items = fresh[:count]
+            self.fetched = time.time()
+            self.guy.apply()
+        return False
+
+
+# ---------- stock prices (Yahoo Finance, no key needed) ----------
+STOCKS_CONFIG = Path.home() / ".config/guy/stocks.json"
+STOCKS_EVERY = 600                # seconds between watchlist refreshes in the background
+YF_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) GUY/1.0"}
+STOCK_WORDS = re.compile(r"\b(stocks?|shares?|share price|stock price|price|quote|ticker|trading at)\b", re.I)
+STOCK_FILLER = re.compile(r"\b(what(?:'s| is| are)?|whats|how(?:'s| is)?|hows|the|of|for|on|is|doing|today|now|"
+                          r"right now|current|currently|latest|check|show me|look up|get|me|at|stocks?|shares?|"
+                          r"share price|stock price|price|quote|ticker|trading)\b", re.I)
+
+
+def stock_query(text):
+    """"google stock", "GOOGL price", "what's tesla trading at", "$NVDA": the company or ticker asked
+    about, or None when it isn't about stocks."""
+    t = text.strip().rstrip("?!. ")
+    if re.fullmatch(r"\$[A-Za-z][A-Za-z.\-]{0,9}", t):
+        return t[1:].upper()
+    if not STOCK_WORDS.search(t):
+        return None
+    name = STOCK_FILLER.sub(" ", t.replace("'s ", " ").replace("’s ", " "))
+    name = re.sub(r"[^\w .&\-^=]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    # a real question about stocks ("how many shares should I buy") is for GUY, not a price lookup
+    if len(name.split()) > 3 or re.search(r"\b(i|my|you|we|should|why|when|many|much|buy|sell|did|will|would|can|"
+                                          r"invest|worth|best|good)\b", name, re.I):
+        return None
+    return name or None
+
+
+def _yf_json(url):
+    import urllib.request
+    req = urllib.request.Request(url, headers=YF_HEADERS)
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return json.loads(r.read())
+
+
+def fetch_quote(symbol):
+    """{symbol, name, price, change, pct, currency, exchange, low, high, prev, time} or None."""
+    try:
+        data = _yf_json("https://query1.finance.yahoo.com/v8/finance/chart/"
+                        + urllib.parse.quote(symbol) + "?range=1d&interval=1d")
+        m = data["chart"]["result"][0]["meta"]
+    except Exception:  # noqa: BLE001 - unknown symbol, offline, rate-limited
+        return None
+    price = m.get("regularMarketPrice")
+    prev = m.get("chartPreviousClose") or m.get("previousClose")
+    if price is None:
+        return None
+    change = price - prev if prev else 0.0
+    return {"symbol": m.get("symbol", symbol), "name": m.get("longName") or m.get("shortName") or symbol,
+            "price": price, "change": change, "pct": (change / prev * 100) if prev else 0.0,
+            "currency": m.get("currency") or "", "exchange": m.get("fullExchangeName") or m.get("exchangeName") or "",
+            "low": m.get("regularMarketDayLow"), "high": m.get("regularMarketDayHigh"), "prev": prev,
+            "time": m.get("regularMarketTime") or 0}
+
+
+def search_symbols(name, limit=3):
+    try:
+        data = _yf_json("https://query1.finance.yahoo.com/v1/finance/search?newsCount=0&quotesCount=8&q="
+                        + urllib.parse.quote(name))
+    except Exception:  # noqa: BLE001
+        return []
+    keep = ("EQUITY", "ETF", "INDEX", "CRYPTOCURRENCY", "CURRENCY")
+    return [q["symbol"] for q in data.get("quotes", []) if q.get("quoteType") in keep and q.get("symbol")][:limit]
+
+
+def fmt_price(q):
+    p = q["price"]
+    digits = 2 if p >= 1 else 4
+    arrow = "▲" if q["change"] > 0 else "▼" if q["change"] < 0 else "·"
+    return (f"{p:,.{digits}f} {q['currency']}  {arrow} {q['change']:+,.{digits}f} ({q['pct']:+.2f}%)").strip()
+
+
+def stock_url(symbol):
+    return "https://finance.yahoo.com/quote/" + urllib.parse.quote(symbol)
+
+
+class Stocks:
+    """Your watchlist (~/.config/guy/stocks.json: {"watch": ["GOOGL", "AAPL"]}), refreshed every 10
+    minutes and when the overview opens on old prices, and lookups for anything you type or say."""
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.quotes = {}           # symbol -> quote, for the watchlist
+        self.fetched = 0.0
+        self.busy = False
+        self.cache = {}            # lookup name -> (time, [quotes])
+        self.waiting = {}          # lookup name -> callbacks, while it's being fetched
+        GLib.timeout_add_seconds(20, lambda: self.refresh() and False)
+        GLib.timeout_add_seconds(STOCKS_EVERY, self.refresh)
+
+    @staticmethod
+    def watchlist():
+        try:
+            return [str(x).upper() for x in json.loads(STOCKS_CONFIG.read_text()).get("watch", [])]
+        except (OSError, ValueError, AttributeError):
+            return []
+
+    @staticmethod
+    def save_watchlist(symbols):
+        STOCKS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = json.loads(STOCKS_CONFIG.read_text())
+        except (OSError, ValueError):
+            cfg = {}
+        cfg["watch"] = symbols
+        STOCKS_CONFIG.write_text(json.dumps(cfg, indent=1) + "\n")
+
+    def watch(self, symbol, on=True):
+        symbols = [s for s in self.watchlist() if s != symbol.upper()]
+        if on:
+            symbols.append(symbol.upper())
+        self.save_watchlist(symbols)
+        self.quotes = {k: v for k, v in self.quotes.items() if k in symbols}
+        self.refresh()
+
+    def stale(self):
+        return time.time() - self.fetched > 120
+
+    def refresh(self):
+        symbols = self.watchlist()
+        if self.busy or not symbols:
+            if not symbols and self.quotes:
+                self.quotes = {}
+                self.guy.apply()
+            return True
+        self.busy = True
+
+        def work():
+            got = {}
+            for sym in symbols:
+                if (q := fetch_quote(sym)) is not None:
+                    got[sym] = q
+            GLib.idle_add(self.got, got)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def got(self, quotes):
+        self.busy = False
+        if quotes:
+            self.quotes.update(quotes)
+            self.fetched = time.time()
+        self.guy.apply()
+        return False
+
+    def lookup(self, name, done):
+        """Quotes for a company or ticker, best match first, handed to done(name, quotes) on the main loop."""
+        hit = self.cache.get(name.lower())
+        if hit and time.time() - hit[0] < 60:
+            GLib.idle_add(done, name, hit[1])
+            return
+        key = name.lower()
+        if key in self.waiting:                # already on its way (typing and voice at once)
+            self.waiting[key].append(done)
+            return
+        self.waiting[key] = [done]
+
+        def finished(found):
+            for fn in self.waiting.pop(key, []):
+                fn(name, found)
+            return False
+
+        def work():
+            symbols = []
+            if re.fullmatch(r"[A-Za-z][A-Za-z.\-^=]{0,9}", name) and (q := fetch_quote(name.upper())):
+                found = [q]                      # it's a ticker as typed
+                symbols = [q["symbol"]]
+            else:
+                found = []
+            for sym in search_symbols(name):
+                if sym not in symbols and len(found) < 3 and (q := fetch_quote(sym)):
+                    symbols.append(sym)
+                    found.append(q)
+            self.cache[key] = (time.time(), found)
+            GLib.idle_add(finished, found)
+
+        threading.Thread(target=work, daemon=True).start()
+
+
 class ProcNames:
     """Which processes are package tools or sudo, cheaply: each new pid's name is read twice (once
     may catch it between fork and exec) and then remembered, so a poll costs a directory listing
@@ -1888,6 +2483,17 @@ class Guy:
         self.activities = {}
         self.updates = None        # (count, "pacman 10  ·  yay 2") from HyDE's checker
         self.faces = []
+        # pulled out: floating on the screen instead of hanging from the top edge
+        self.floating = False
+        self.anchor = (0.0, 0.0)   # the floating orb's centre
+        self.pulling = False       # being pulled out, still joined
+        self.absorbing = False     # flying back into the top edge
+        self.retracting = False    # let go too early: the drop goes back in
+        self.grab = None           # the drag in progress
+        self.reaching = False      # dragged near the top edge: the island reaches down for him
+        self.home = None           # the flight home, phase by phase (see dock)
+        self.input_all = False     # the whole surface takes the pointer (while dragging)
+        self.aside_until = 0.0     # guy-computer is using the screen: clicks pass through the orb
         self.home_expanded = None  # the overview row that's open, showing everything about it
         self.home_shown = None     # what the overview's rows were last built from
         # Ask GUY
@@ -1905,11 +2511,12 @@ class Guy:
         win = Gtk.ApplicationWindow(application=app)
         win.remove_css_class("background")
         win.add_css_class("guy")
-        win.set_default_size(SURF_W, SURF_H)
         LayerShell.init_for_window(win)
         LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
         LayerShell.set_namespace(win, "guy")
-        LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+        # the whole screen, so a pulled-out GUY can float anywhere; the input region keeps it click-through
+        for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+            LayerShell.set_anchor(win, edge, True)
         LayerShell.set_exclusive_zone(win, -1)
         LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
         self.win = win
@@ -1921,10 +2528,17 @@ class Guy:
         self.stack.add_named(self.build_approval(), "approval")
         self.stack.add_named(self.build_ask(), "ask")
         self.stack.add_named(self.build_drop(), "drop")
+        self.stack.add_named(self.build_orb(), "orb")
         self.stack.set_visible(False)
         self.island = Island(self.stack)
-        self.island.on_target = self.kick
+        self.island.on_target = self.retarget
         win.set_child(self.island)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_grab)
+        drag.connect("drag-update", self.on_grab_move)
+        drag.connect("drag-end", self.on_grab_end)
+        self.island.add_controller(drag)
+        win.connect("notify::is-active", lambda *_: self.focus_changed())
 
         motion = Gtk.EventControllerMotion()
         motion.connect("enter", self.on_enter)
@@ -1966,6 +2580,9 @@ class Guy:
         self.pacman = PacmanWatcher(self)
         self.prompts = PromptWatcher(self)
         self.media = MediaWatcher(self)
+        self.news = NewsWatcher(self)
+        self.stocks = Stocks(self)
+        self.stock_timer = None
         self.app_monitor = Gio.AppInfoMonitor.get()   # kept: the monitor only lives while referenced
         self.app_monitor.connect("changed", _apps_changed)
         GLib.idle_add(lambda: load_apps() and False)   # warm the cache so the first Alt+Space is quick
@@ -1979,6 +2596,7 @@ class Guy:
 
         win.present()
         GLib.idle_add(self.update_input_region)
+        GLib.timeout_add(400, self.restore_float)
         GLib.timeout_add_seconds(60, self.prune)
         self.flash("Hi, I'm GUY  ·  Alt+Space to ask me", "done", 3.0)
 
@@ -1999,6 +2617,36 @@ class Guy:
         click.connect("released", lambda *_: self.focus_prompt() if self.prompt else self.open_home())
         box.add_controller(click)
         return box
+
+    def build_orb(self):
+        box = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        box.set_size_request(ORB, ORB)
+        f = self.face(46)
+        f.set_halign(Gtk.Align.CENTER)
+        f.set_hexpand(True)
+        box.append(f)
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.on_orb_press)
+        click.connect("released", self.on_orb_release)
+        box.add_controller(click)
+        self.orb_hint = None
+        return box
+
+    def on_orb_press(self, _g, n, _x, _y):
+        if n == 2:                               # double-click: the overview, out of the orb
+            if self.orb_hint:
+                GLib.source_remove(self.orb_hint)
+                self.orb_hint = None
+            self.open_home()
+
+    def on_orb_release(self, _g, n, _x, _y):
+        if n == 1 and not (self.grab and self.grab["moved"]) and not self.orb_hint:
+            self.orb_hint = GLib.timeout_add(280, self.show_orb_hint)
+
+    def show_orb_hint(self):
+        self.orb_hint = None
+        self.flash("Esc or drag to the top to put me back  ·  double-click for more", "idle", 2.6)
+        return False
 
     def build_home(self):
         box = Gtk.Box(spacing=20)
@@ -2178,9 +2826,10 @@ class Guy:
         if self.user_mode == "home":
             return "home"
         now = time.monotonic()
-        if self.hover or self.active() or now < self.flash_until or now < self.linger_until:
+        hover = self.hover and not self.floating   # a floating GUY doesn't peek just from the pointer
+        if hover or self.active() or now < self.flash_until or now < self.linger_until:
             return "peek"
-        return "hidden"
+        return "orb" if self.floating else "hidden"
 
     def mood(self):
         if self.voice_state == "listening":
@@ -2199,7 +2848,26 @@ class Guy:
         mode = self.compute_mode()
         self.refresh_pages(mode)
         isl = self.island
-        if mode != self.mode:
+        if self.pulling or self.absorbing:       # mid-flight: the drag/absorb drives the glass
+            self.kick()
+            return False
+        if mode != self.mode and self.floating:
+            prev, self.mode = self.mode, mode
+            if prev == "ask":
+                self.leave_ask()
+            if mode == "ask":
+                self.enter_ask()
+            self.pending = mode
+            isl.follow = False
+            page = self.stack.get_child_by_name(mode)
+            isl.tfw = float(self.page_width(mode))
+            isl.tfh = float(ORB if mode == "orb" else isl.page_height(page, isl.tfw))
+            self.place_float()
+        elif mode == "peek" and self.floating:
+            isl.tfw = float(self.page_width("peek"))
+            self.place_float()
+            isl.queue_allocate()
+        elif mode != self.mode:
             prev, self.mode = self.mode, mode
             if prev == "ask":
                 self.leave_ask()
@@ -2227,6 +2895,8 @@ class Guy:
         return False
 
     def page_width(self, mode):
+        if mode == "orb":
+            return ORB
         if mode == "peek":
             nat = self.stack.get_child_by_name("peek").measure(Gtk.Orientation.HORIZONTAL, -1)[1]
             return max(170, min(460, nat))
@@ -2285,7 +2955,10 @@ class Guy:
         updates = self.updates if self.updates and self.updates[0] else None
         schedule = sorted(self.schedule, key=lambda i: i.get("at", ""))[:3]
         playing = self.media.now and self.media.now["status"] == "Playing"
-        shown = (self.prompt, self.home_expanded, updates, playing,
+        news = self.news.items
+        watch = [self.stocks.quotes[s] for s in self.stocks.watchlist() if s in self.stocks.quotes]
+        shown = (self.prompt, self.home_expanded, updates, playing, tuple(news),
+                 tuple((q["symbol"], q["price"], q["change"]) for q in watch),
                  [(s.id, s.status, s.last, bool(s.reply), age(s.updated)) for s in sessions],
                  [(a.key, a.state, a.title, a.detail, a.progress, bool(a.open), bool(getattr(a, "reply", None)),
                    age(a.updated)) for a in acts],
@@ -2300,7 +2973,7 @@ class Guy:
                                                 else "input-keyboard-symbolic")
             icon.add_css_class("aicon")
             self.add_row(icon, self.prompt["text"], "Click to go to the terminal", None, self.focus_prompt)
-        if not (sessions or acts or updates or self.prompt or schedule):
+        if not (sessions or acts or updates or self.prompt or schedule or news or watch):
             empty = Gtk.Label(xalign=0, wrap=True, max_width_chars=60,
                               label="Nothing running. Drop a file on me, or press Alt+Space and ask me anything.")
             empty.add_css_class("empty")
@@ -2355,6 +3028,22 @@ class Guy:
             self.add_row(icon, item.get("text", ""), when + every, None, None, None,
                          self.small_button("Cancel", buttons[-1][1]), key=f"sched:{item.get('id')}",
                          more=more, buttons=buttons[:-1])
+        if watch:
+            icon = Gtk.Image.new_from_icon_name("utilities-system-monitor-symbolic")
+            icon.add_css_class("aicon")
+            summary = "   ".join(f"{q['symbol']} {q['price']:,.2f} {q['pct']:+.1f}%" for q in watch)
+            more = [(f"{q['symbol']}  ·  {q['exchange']}", f"{q['name']}   {fmt_price(q)}"
+                     + (f"   day {q['low']:,.2f}–{q['high']:,.2f}" if q["low"] and q["high"] else ""),
+                     lambda u=stock_url(q["symbol"]): self.open_link(u)) for q in watch]
+            self.add_row(icon, "Stocks", summary, age(self.stocks.fetched), key="stocks", more=more,
+                         buttons=[("Refresh", self.stocks.refresh)])
+        if news:
+            icon = Gtk.Image.new_from_icon_name("application-rss+xml-symbolic")
+            icon.add_css_class("aicon")
+            more = [(f"{src}  ·  {age(when) if when else ''}", title, lambda u=link: self.open_link(u))
+                    for when, title, link, src in news]
+            self.add_row(icon, "News", news[0][1], age(news[0][0]) if news[0][0] else None, key="news", more=more,
+                         buttons=[("Brief me", self.news_brief), ("Refresh", self.news.refresh)])
         if updates:
             icon = Gtk.Image.new_from_icon_name("system-software-update-symbolic")
             icon.add_css_class("aicon")
@@ -2362,6 +3051,21 @@ class Guy:
             self.add_row(icon, f"{updates[0]} {noun} available", updates[1], None, None, None,
                          self.small_button("Update", self.run_update), key="updates",
                          more=[("", updates[1]), ("", "Update opens kitty running yay -Syu")])
+
+    def open_link(self, url):
+        spawn("xdg-open", url)
+        self.user_mode = None
+        self.hover = False
+        self.apply()
+
+    def news_brief(self):
+        """GUY reads the headlines and gives you the short version, in Ask GUY; you can ask about any of them."""
+        lines = "\n".join(f"- {title} ({src}) {link}" for _w, title, link, src in self.news.items)
+        self.user_mode = None
+        self.open_ask()
+        self.ask_claude("Give me a quick brief of the news right now: a sentence or two on each of these, most "
+                        "important first. Look things up if a headline needs context.\n\n" + lines,
+                        shown="Brief me on the news")
 
     def small_button(self, label, fn):
         b = Gtk.Button(label=label)
@@ -2439,8 +3143,18 @@ class Guy:
         if expanded:
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
             box.add_css_class("more")
-            for label, value in more or ():
+            for label, value, *link in more or ():
                 if not value:
+                    continue
+                if link:                         # (label, text, fn): a line you can click
+                    b = Gtk.Button()
+                    b.add_css_class("link-row")
+                    t = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, max_width_chars=80)
+                    t.set_markup(f"<span alpha='60%'>{GLib.markup_escape_text(label)}</span>  "
+                                 + GLib.markup_escape_text(str(value)))
+                    b.set_child(t)
+                    b.connect("clicked", lambda _b, fn=link[0]: fn())
+                    box.append(b)
                     continue
                 v = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, selectable=True,
                               max_width_chars=80)
@@ -2767,6 +3481,25 @@ class Guy:
             if said:
                 self.speak(". ".join(r for r in replies if r) or "Done", follow=True)
                 return
+        if name := stock_query(text):
+            self.open_ask(keep=True)
+            self.set_view("idle")
+            self.entry.set_text(text)
+            self.entry.set_position(-1)
+
+            def say(_name, quotes):
+                self.stock_ready(_name, quotes)
+                if not quotes:
+                    self.speak(f"I couldn't find a stock called {name}", follow=True)
+                else:
+                    q = quotes[0]
+                    move = "flat" if not q["change"] else (f"{'up' if q['change'] > 0 else 'down'} "
+                                                           f"{abs(q['pct']):.1f} percent")
+                    self.speak(f"{q['name']} is at {q['price']:,.2f} {q['currency']}, {move} today.", follow=True)
+                return False
+
+            self.stocks.lookup(name, say)
+            return
         self.open_ask(keep=True)
         self.entry.set_text(text)
         self.entry.set_position(-1)
@@ -2943,6 +3676,33 @@ class Guy:
         kh = 210.0 if isl.th > isl.h else 300.0
         isl.vh += (-kh * (isl.h - isl.th) - 2 * 0.7 * math.sqrt(kh) * isl.vh) * dt
         isl.h = max(0.0, isl.h + isl.vh * dt)
+        if isl.fvis:
+            # the floating glass: it follows a little behind the pointer, and wobbles like a drop
+            kp = 900.0 if self.grab and self.grab["moved"] else 260.0
+            cp = 2 * (0.9 if self.grab and self.grab["moved"] else 0.72) * math.sqrt(kp)
+            isl.vfx += (-kp * (isl.fx - isl.tfx) - cp * isl.vfx) * dt
+            isl.vfy += (-kp * (isl.fy - isl.tfy) - cp * isl.vfy) * dt
+            isl.fx += isl.vfx * dt
+            isl.fy += isl.vfy * dt
+            ks = 260.0
+            cs = 2 * 0.55 * math.sqrt(ks)
+            isl.vfw += (-ks * (isl.fw - isl.tfw) - cs * isl.vfw) * dt
+            isl.vfh += (-ks * (isl.fh - isl.tfh) - cs * isl.vfh) * dt
+            isl.fw = max(0.0, isl.fw + isl.vfw * dt)
+            isl.fh = max(0.0, isl.fh + isl.vfh * dt)
+        if not isl.stretching and (isl.sx != 1.0 or isl.sy != 1.0 or isl.vsx or isl.vsy):
+            ks = 420.0
+            cs = 2 * 0.45 * math.sqrt(ks)            # springs back past 1 and wobbles a little, like taffy
+            isl.vsx += (-ks * (isl.sx - 1) - cs * isl.vsx) * dt
+            isl.vsy += (-ks * (isl.sy - 1) - cs * isl.vsy) * dt
+            isl.sx += isl.vsx * dt
+            isl.sy += isl.vsy * dt
+            if abs(isl.sx - 1) < 0.001 and abs(isl.sy - 1) < 0.001 and abs(isl.vsx) < 0.01 and abs(isl.vsy) < 0.01:
+                isl.sx = isl.sy = 1.0
+                isl.vsx = isl.vsy = 0.0
+        self.flight(dt)
+        if isl.floating:
+            isl.queue_allocate()                 # the page rides along with the floating glass
 
         if self.pending and isl.alpha <= 0.01:
             self.stack.set_visible_child_name(self.pending)
@@ -2952,8 +3712,13 @@ class Guy:
             self.pending = None
             isl.follow = True
             isl.queue_allocate()
-        near = abs(isl.w - isl.tw) < 0.2 * isl.tw + 6 and abs(isl.h - isl.th) < 0.25 * isl.th + 6
-        want = 0.0 if (self.pending or self.mode == "hidden") else (1.0 if near else isl.alpha)
+        pw, ph, ptw, pth = isl.primary()
+        near = abs(pw - ptw) < 0.2 * ptw + 6 and abs(ph - pth) < 0.25 * pth + 6
+        if isl.floating:
+            near = near and abs(isl.fy - isl.tfy) < 40 and abs(isl.fx - isl.tfx) < 60
+        want = (0.0 if (self.pending or self.mode == "hidden"
+                        or (self.pulling and not isl.floating and isl.fy - isl.h > 30))
+                else (1.0 if near else isl.alpha))
         if want < isl.alpha:
             isl.alpha = max(want, isl.alpha - dt / 0.09)
         else:
@@ -2966,9 +3731,18 @@ class Guy:
         isl.queue_draw()
         self.update_input_region()
         settled = (abs(isl.w - isl.tw) < 0.3 and abs(isl.vw) < 2 and abs(isl.h - isl.th) < 0.3
-                   and abs(isl.vh) < 2 and isl.alpha == want and not self.pending)
+                   and abs(isl.vh) < 2 and isl.alpha == want and not self.pending
+                   and not (self.pulling or self.absorbing or self.retracting or (self.grab and self.grab["moved"]))
+                   and (not isl.fvis or (abs(isl.fx - isl.tfx) < 0.3 and abs(isl.fy - isl.tfy) < 0.3
+                                         and abs(isl.fw - isl.tfw) < 0.3 and abs(isl.fh - isl.tfh) < 0.3
+                                         and max(abs(isl.vfx), abs(isl.vfy), abs(isl.vfw), abs(isl.vfh)) < 2))
+                   and isl.goo in (0.0, 1.0) and (isl.bridge == 0.0 or not isl.fvis) and isl.sx == 1.0 and isl.sy == 1.0 and not isl.stretching)
+        isl.animating = not settled
         if settled:
             isl.w, isl.h, isl.vw, isl.vh = isl.tw, isl.th, 0.0, 0.0
+            if isl.fvis:
+                isl.fx, isl.fy, isl.fw, isl.fh = isl.tfx, isl.tfy, isl.tfw, isl.tfh
+                isl.vfx = isl.vfy = isl.vfw = isl.vfh = 0.0
             isl.queue_draw()
             self.update_input_region()
             self.tick = None
@@ -2980,13 +3754,368 @@ class Guy:
         if surf is None:
             return False
         isl = self.island
-        cx = SURF_W / 2
-        if isl.h < 2 and self.mode == "hidden":
-            rect = (cx - HOT_W / 2, 0, HOT_W, HOT_H)
+        W, H = isl.get_width(), isl.get_height()
+        if self.input_all:                       # dragging: follow the pointer anywhere
+            surf.set_input_region(cairo.Region(cairo.RectangleInt(0, 0, W, H)))
+            return False
+        cx = W / 2
+        rects = []
+        if not self.floating:
+            if isl.h < 2 and self.mode == "hidden":
+                rects.append((cx - HOT_W / 2, 0, HOT_W, HOT_H))
+            else:
+                s, _r, bulge = isl.geometry()
+                rects.append((cx - isl.w / 2 - s, 0, isl.w + 2 * s, max(HOT_H, isl.h + bulge)))
+        if isl.fvis and time.monotonic() >= self.aside_until:
+            rects.append(isl.float_rect())
+        region = cairo.Region()
+        for rect in rects:
+            region.union(cairo.RectangleInt(*(int(round(v)) for v in rect)))
+        surf.set_input_region(region)
+        return False
+
+    # ----- pulled out: floating GUY -----
+    def screen(self):
+        return self.island.get_width() or SURF_W, self.island.get_height() or SURF_H
+
+    def clamp_anchor(self, x, y):
+        W, H = self.screen()
+        m = ORB / 2 + 10
+        top = ORB / 2 + (1 if self.grab and self.grab["moved"] else 10)   # carried, it can touch the edge
+        return max(m, min(W - m, x)), max(top, min(H - m, y))
+
+    def place_float(self):
+        """Where the floating glass goes: the orb at the anchor; a page (peek, overview, Ask) opens out of
+        it, below it, or above it when it's low on the screen, kept on screen."""
+        isl = self.island
+        W, H = self.screen()
+        ax, ay = self.anchor
+        w, h = isl.tfw, isl.tfh
+        if self.mode == "orb" or w <= ORB:
+            isl.tfx, isl.tfy = ax, ay - ORB / 2
+            return
+        isl.tfx = max(w / 2 + 12, min(W - w / 2 - 12, ax))
+        top = ay - ORB / 2
+        if self.grab and self.grab["moved"]:     # being carried: it stays under the hand, kept on screen
+            isl.tfy = max(1, min(H - h - 12, top))
+            return
+        if top + h > H - 12:
+            top = ay + ORB / 2 - h
+        isl.tfy = max(12, min(H - h - 12, top))
+
+    def retarget(self):
+        if self.floating and not (self.absorbing or self.pulling):
+            self.place_float()
+        self.kick()
+        return False
+
+    PANELS = ("home", "ask", "approval", "drop")
+    GRIP = 58                                    # an open panel is held by its top strip (the penguin, the title)
+
+    def grippable(self, x, y):
+        """Not on something that has its own use for a drag or a press: the text field, a button, a row."""
+        w = self.island.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while w is not None and w is not self.island:
+            if isinstance(w, (Gtk.Text, Gtk.Entry, Gtk.Button, Gtk.ListBoxRow, Gtk.ScrolledWindow)):
+                return False
+            w = w.get_parent()
+        return True
+
+    def on_grab(self, _g, x, y):
+        isl = self.island
+        self.grab = None
+        if self.absorbing or self.pulling:
+            return
+        if self.floating and isl.fvis:
+            fx, fy, fw, fh = isl.float_rect()
+            inside = fx <= x <= fx + fw and fy <= y <= fy + fh
+            if inside and (self.mode in ("orb", "peek") or (self.mode in self.PANELS and y <= fy + self.GRIP
+                                                            and self.grippable(x, y))):
+                self.grab = {"kind": "move", "x0": x, "y0": y, "moved": False,
+                             "dx": self.anchor[0] - x, "dy": self.anchor[1] - y}
+            return
+        cx = isl.get_width() / 2
+        if abs(x - cx) > isl.w / 2 or y > isl.h:
+            return
+        if self.mode == "peek":
+            self.grab = {"kind": "pull", "x0": x, "y0": y, "moved": False, "dx": 0.0, "dy": 0.0}
+        elif self.mode in self.PANELS and y <= self.GRIP and self.grippable(x, y):
+            # tearing an open panel off the top edge: it keeps its page, and follows where it was held
+            self.grab = {"kind": "tear", "x0": x, "y0": y, "moved": False, "dx": 0.0, "dy": 0.0,
+                         "w": isl.tw, "h": isl.th}
+
+    def on_grab_move(self, g, ox, oy):
+        d = self.grab
+        if d is None:
+            return
+        if not d["moved"]:
+            if (d["kind"] == "pull" and oy < 12) or (d["kind"] == "move" and math.hypot(ox, oy) < 6):
+                return
+            d["moved"] = True
+            g.set_state(Gtk.EventSequenceState.CLAIMED)    # not a click on what's underneath
+            self.input_all = True
+            self.update_input_region()
+            if d["kind"] == "pull":
+                self.start_pull()
+            elif d["kind"] == "tear":
+                self.island.follow = False
+        px, py = d["x0"] + ox, d["y0"] + oy
+        d["px"], d["py"] = px, py
+        if d["kind"] == "tear":
+            self.stretch_panel(d, ox, oy)
+        elif d["kind"] == "pull":
+            isl = self.island
+            isl.tfx, isl.tfy, isl.tfw, isl.tfh = px, py - ORB / 2, float(ORB), float(ORB)
         else:
-            s, _r, bulge = isl.geometry()
-            rect = (cx - isl.w / 2 - s, 0, isl.w + 2 * s, max(HOT_H, isl.h + bulge))
-        surf.set_input_region(cairo.Region(cairo.RectangleInt(*(int(round(v)) for v in rect))))
+            self.drag_float(px + d["dx"], py + d["dy"], py)
+        self.kick()
+
+    def on_grab_end(self, _g, ox, oy):
+        d, self.grab = self.grab, None
+        if d is None or not d["moved"]:
+            return
+        self.input_all = False
+        if d["kind"] == "tear":                  # let go before it tore off: it springs back up
+            isl = self.island
+            isl.stretching = False
+            isl.follow = True
+            isl.queue_allocate()
+        elif d["kind"] == "pull" and self.pulling:
+            self.cancel_pull()                   # let go before it snapped off: back in it goes
+        elif d["kind"] == "move" or self.floating:
+            if self.island.bridge >= CONTACT:    # let go while joined to the edge: it attaches
+                self.dock()
+            else:                                # not joined: the droplet goes back up into the edge
+                self.save_float()
+        self.update_input_region()
+        self.kick()
+
+    def stretch_panel(self, d, ox, oy):
+        """Pulling an open panel down: it stretches like taffy (longer, a little narrower, leaning after the
+        pointer), and past TEAR it comes off the edge and floats, still open."""
+        isl = self.island
+        pull = max(0.0, oy)
+        if pull > 95:
+            self.tear_off(d)
+            return
+        # resistance that grows as you pull, so it feels held by the edge until it lets go
+        give = 1 - math.exp(-pull / 120)
+        isl.stretching = True
+        isl.sy = 1 + give * 120 * 0.5 / max(d["h"], 1)
+        isl.sx = 1 - give * 0.06
+
+    def tear_off(self, d):
+        isl = self.island
+        W = isl.get_width()
+        # the floating glass starts exactly where the stretched panel is, already moving with the pointer,
+        # and springs back to its own shape (scaled, not redrawn, so it stays smooth)
+        isl.fvis, isl.goo = True, 0.0
+        isl.fx, isl.fy, isl.fw, isl.fh = W / 2, 0.0, isl.w * isl.sx, isl.h * isl.sy
+        isl.vfx = isl.vfy = 0.0
+        isl.vfw, isl.vfh = 0.0, 0.0
+        isl.tfw, isl.tfh = d["w"], d["h"]
+        isl.sx = isl.sy = 1.0
+        isl.vsx = isl.vsy = 0.0
+        isl.stretching = False
+        self.floating = isl.floating = True
+        # held at the same spot on the panel: its top centre sits where it was, relative to the pointer
+        px, py = d["px"], d["py"]
+        self.anchor = self.clamp_anchor(W / 2 + (px - d["x0"]), (py - d["y0"]) + ORB / 2)
+        d.update(kind="move", dx=self.anchor[0] - px, dy=self.anchor[1] - py)
+        isl.tw, isl.th, isl.h = isl.w, 0.0, 0.0     # the edge lets go of it at once
+        isl.follow = True
+        self.place_float()
+        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.EXCLUSIVE if self.mode == "ask"
+                                     else LayerShell.KeyboardMode.ON_DEMAND)
+        isl.queue_allocate()
+        self.save_float()
+        self.kick()
+
+    def start_pull(self):
+        """A drop starts to come out of the bottom of the island, on a neck."""
+        isl = self.island
+        isl.fvis, isl.goo = True, 1.0
+        isl.fx, isl.fy, isl.fw, isl.fh = isl.get_width() / 2, max(0.0, isl.h - 36), 36.0, 36.0
+        isl.vfx = isl.vfy = isl.vfw = isl.vfh = 0.0
+        self.pulling = True
+
+    def flight(self, dt):
+        """Each frame of a pull, a snap, a drop going back in or GUY flying home."""
+        isl = self.island
+        if self.pulling and isl.fy - isl.h > NECK_LEN * 0.92:
+            self.snap_off()
+        if self.absorbing:
+            self.homing(dt)
+            return
+        self.bridge_reach(dt)
+        if self.pulling or self.retracting or self.reaching:
+            isl.goo = 1.0
+        elif isl.goo > 0:
+            isl.goo = max(0.0, isl.goo - dt / 0.16)      # the neck goes thin and lets go
+        if self.retracting and isl.fy + isl.fh <= isl.h + 6:
+            isl.fvis, isl.goo, self.retracting = False, 0.0, False
+
+    REACH = 60                                   # how near (px from the edge) the edge starts reaching for it
+
+    def bridge_reach(self, dt):
+        """Carried near the top edge, the edge and the glass reach for each other and join (bridge_path),
+        following how close it is: closer and the neck widens, pull away and it thins and pinches off back
+        into a droplet. Let go and the droplet goes back up into the edge."""
+        isl = self.island
+        if not (isl.fvis and self.floating):
+            return
+        target = 0.0
+        if self.grab and self.grab["moved"]:
+            near = max(0.0, 1 - isl.fy / self.REACH)
+            target = near * near * (3 - 2 * near)
+        if abs(target - isl.bridge) > 0.0005:
+            # quick to join, a touch slower to let go, like something sticky
+            rate = 16.0 if target > isl.bridge else 9.0
+            isl.bridge += (target - isl.bridge) * min(1.0, dt * rate)
+            if target == 0.0 and isl.bridge < 0.002:
+                isl.bridge = 0.0
+            isl.queue_draw()
+
+    def snap_off(self):
+        """Pulled far enough: the neck snaps, the island goes back up, and GUY floats."""
+        isl = self.island
+        self.pulling = False
+        self.floating = isl.floating = True
+        self.anchor = self.clamp_anchor(isl.tfx, isl.tfy + ORB / 2)
+        if self.grab:                            # keep dragging the orb, held where it is under the pointer
+            px, py = self.grab.get("px", self.anchor[0]), self.grab.get("py", self.anchor[1])
+            self.grab.update(kind="move", dx=self.anchor[0] - px, dy=self.anchor[1] - py)
+        isl.vfw += 260.0                          # the snap makes him wobble
+        isl.vfh -= 260.0
+        isl.tw, isl.th = isl.w, 0.0               # the island retracts into the edge
+        self.user_mode = None if self.user_mode == "home" else self.user_mode
+        self.hover = False
+        self.mode = None                         # whatever it shows now, it shows it in the orb
+        self.stack.set_visible(False)
+        self.pending = None
+        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.ON_DEMAND)
+        self.apply()
+        self.save_float()
+
+    def cancel_pull(self):
+        isl = self.island
+        self.pulling, self.retracting = False, True
+        isl.tfx, isl.tfy, isl.tfw, isl.tfh = isl.get_width() / 2, max(0.0, isl.h - 30), 30.0, 30.0
+
+    def drag_float(self, x, y, pointer_y):
+        """Moving the floating GUY. Near the top edge the island reaches down for him."""
+        isl = self.island
+        self.anchor = self.clamp_anchor(x, y)
+        self.place_float()
+
+    def pop_out(self):
+        """`guy --float`: drops out of the top edge and floats, at the last place it floated."""
+        if self.floating or self.pulling:
+            return
+        isl = self.island
+        W, H = self.screen()
+        try:
+            saved = json.loads(FLOAT_STATE.read_text())
+            x, y = float(saved.get("x", W * 0.85)), float(saved.get("y", H * 0.3))
+        except (OSError, ValueError, TypeError):
+            x, y = W * 0.85, H * 0.3
+        isl.fvis, isl.goo = True, 0.0
+        isl.fx, isl.fy, isl.fw, isl.fh = W / 2, -ORB, float(ORB), float(ORB)
+        isl.vfx = isl.vfy = isl.vfw = isl.vfh = 0.0
+        self.floating = isl.floating = True
+        self.anchor = self.clamp_anchor(x, y)
+        isl.tw, isl.th = isl.w, 0.0
+        self.mode = None
+        self.stack.set_visible(False)
+        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.ON_DEMAND)
+        self.apply()
+        self.save_float()
+
+    def dock(self):
+        """Back home at the size it is: it rises to the top centre, the edge reaches down and catches it
+        with a liquid bridge that spreads across its width, and once it hangs from the edge like the
+        island it is the island, and is drawn up into the edge. Driven frame by frame in homing()."""
+        if not self.floating or self.absorbing:
+            return
+        isl = self.island
+        self.absorbing = True
+        self.reaching = False
+        isl.follow = False                       # the page's size no longer steers the glass
+        isl.goo = 0.0
+        cx = isl.get_width() / 2
+        d = math.hypot(isl.fx - cx, isl.fy)
+        self.home = {"t": 0.0, "x0": isl.fx, "y0": isl.fy, "b0": isl.bridge,
+                     "dur": max(0.3, min(0.6, d / 1400))}
+        isl.tw, isl.th = isl.w, 0.0
+        self.kick()
+
+    def homing(self, dt):
+        isl = self.island
+        h = self.home
+        h["t"] += dt
+        u = min(1.0, h["t"] / h["dur"])
+        cx = isl.get_width() / 2
+        # across to the middle early, up all the way, quickening at the end as the edge takes it
+        ex = 1 - (1 - min(1.0, u * 1.3)) ** 3
+        ey = u * u * (3 - 2 * u) * 0.6 + u ** 3 * 0.4
+        x = h["x0"] + (cx - h["x0"]) * ex
+        top = h["y0"] * (1 - ey)
+        self.set_float(x, top, isl.fw, isl.fh)
+        # the bridge reaches down once it's within 120 px, and is whole as it touches
+        near = max(0.0, 1 - top / self.REACH)
+        isl.bridge = max(h["b0"], near * near * (3 - 2 * near))
+        isl.queue_draw()
+        if u >= 1:
+            self.attached()
+
+    def set_float(self, x, top, w, h):
+        """Put the floating glass exactly here this frame (the springs just hold it)."""
+        isl = self.island
+        isl.fx = isl.tfx = x
+        isl.fy = isl.tfy = top
+        isl.fw = isl.tfw = max(1.0, w)
+        isl.fh = isl.tfh = max(1.0, h)
+        isl.vfx = isl.vfy = isl.vfw = isl.vfh = 0.0
+
+    def attached(self):
+        """It hangs from the edge exactly like the island now, so it becomes the island (same size, same
+        page), then the island is drawn up into the edge, the way it always closes."""
+        isl = self.island
+        self.absorbing = False
+        self.home = None
+        isl.w = isl.tw = isl.fw
+        isl.h = isl.th = isl.fh
+        isl.vw = isl.vh = 0.0
+        self.floating = isl.floating = False
+        isl.fvis, isl.goo, isl.bridge, isl.ring = False, 0.0, 0.0, 0.0
+        isl.queue_allocate()
+        self.user_mode = None                        # Ask closes as it goes up; the conversation carries on
+        self.flash_until = self.linger_until = 0.0
+        self.hover = False
+        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.NONE)
+        self.save_float()
+        GLib.timeout_add(90, self.apply)             # a beat attached, then up it goes
+
+    def focus_changed(self):
+        ring = 1.0 if (self.floating and self.win.is_active() and self.mode != "ask") else 0.0
+        if ring != self.island.ring:
+            self.island.ring = ring
+            self.island.queue_draw()
+
+    def save_float(self):
+        try:
+            FLOAT_STATE.parent.mkdir(parents=True, exist_ok=True)
+            FLOAT_STATE.write_text(json.dumps({"floating": self.floating, "x": self.anchor[0], "y": self.anchor[1]}))
+        except OSError:
+            pass
+
+    def restore_float(self):
+        """Floating when GUY last stopped: float again, where he was."""
+        try:
+            if json.loads(FLOAT_STATE.read_text()).get("floating"):
+                self.pop_out()
+        except (OSError, ValueError, AttributeError):
+            pass
         return False
 
     # ----- pointer -----
@@ -2995,7 +4124,9 @@ class Guy:
         for a moment, and the catcher unmapping under the pointer sends an enter; neither should
         count as the pointer arriving."""
         isl = self.island
-        cx = SURF_W / 2
+        if self.floating:
+            return False
+        cx = isl.get_width() / 2
         if isl.th < 1:
             return abs(x - cx) <= HOT_W / 2 and y <= HOT_H + 2
         return abs(x - cx) <= isl.tw / 2 + SHOULDER and y <= isl.th + 4
@@ -3031,6 +4162,10 @@ class Guy:
     def open_home(self):
         if self.user_mode is None:
             self.user_mode = "home"
+            if self.news.stale():                # back from sleep, say: fetch, and the row updates itself
+                self.news.refresh()
+            if self.stocks.stale():
+                self.stocks.refresh()
             self.apply()
 
     # ----- files dragged onto the island -----
@@ -3072,8 +4207,14 @@ class Guy:
         if ev.get("guy_command") == "activity":
             self.on_activity_command(ev)
             return False
+        if ev.get("guy_command") == "float":
+            self.dock() if self.floating else self.pop_out()
+            return False
         if ev.get("guy_command") == "aside":
-            # guy-computer is about to look at or use the screen: hide the panel, let go of the keyboard
+            # guy-computer is about to look at or use the screen: hide the panel, let go of the keyboard,
+            # and let clicks pass through a floating GUY for a moment
+            self.aside_until = time.monotonic() + 4.0
+            GLib.timeout_add(4100, self.update_input_region)
             self.agent_status = "using your computer…"
             self.close_ask()
             self.apply()
@@ -3245,7 +4386,9 @@ class Guy:
         self.catcher.present()
 
     def leave_ask(self):
-        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.NONE)
+        # floating, GUY takes the keyboard when you click him (so Esc can put him back)
+        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.ON_DEMAND if self.floating
+                                     else LayerShell.KeyboardMode.NONE)
         self.catcher.set_visible(False)
 
     def set_attachment(self, path):
@@ -3284,6 +4427,19 @@ class Guy:
             items.append({"kind": "claude", "title": f"Ask GUY about {name}" + (f": {q}" if q else ""),
                           "subtitle": "GUY reads the file, then answers right here",
                           "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
+        elif q and (name := stock_query(q)):
+            card = self.stock_items(name)
+            if card is None:
+                card = [{"kind": "info", "title": f"Looking up {name}…", "subtitle": "Yahoo Finance",
+                         "icon": "utilities-system-monitor-symbolic", "hint": ""}]
+                if self.stock_timer:
+                    GLib.source_remove(self.stock_timer)
+                self.stock_timer = GLib.timeout_add(300, self.stock_fetch, name)
+            items += card
+            items.append({"kind": "claude", "title": f"Ask GUY: {q}", "subtitle": "Answer right here",
+                          "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
+            items.append({"kind": "web", "title": f"Search Google for “{q}”", "subtitle": "Opens in your browser",
+                          "icon": "web-browser", "hint": "Ctrl+↵", "query": q})
         elif q and (said := intents(q)):
             icon = {"timer": "alarm-symbolic", "timer-cancel": "alarm-symbolic", "open": "system-run-symbolic",
                     "dismiss": "window-close-symbolic",
@@ -3319,6 +4475,41 @@ class Guy:
             items.append({"kind": "web", "title": f"Search Google for “{q}”", "subtitle": "Opens in your browser",
                           "icon": "web-browser", "hint": "Ctrl+↵", "query": q})
         self.show_items(items)
+
+    def stock_fetch(self, name):
+        self.stock_timer = None
+        self.stocks.lookup(name, self.stock_ready)
+        return False
+
+    def stock_ready(self, name, _quotes):
+        """A lookup finished: redraw the list if it's still what's being typed."""
+        if self.user_mode == "ask" and self.view != "answer" and stock_query(self.entry.get_text()) == name:
+            self.refresh(self.entry.get_text())
+        return False
+
+    def stock_items(self, name):
+        hit = self.stocks.cache.get(name.lower())
+        if not hit or time.time() - hit[0] > 60:
+            return None
+        quotes = hit[1]
+        if not quotes:
+            return [{"kind": "info", "title": f"No stock found for “{name}”", "subtitle": "Try the ticker, like GOOGL",
+                     "icon": "dialog-information-symbolic", "hint": ""}]
+        watching = self.stocks.watchlist()
+        items = []
+        for q in quotes:
+            when = time.strftime("%a %H:%M", time.localtime(q["time"])) if q["time"] else ""
+            day = f"day {q['low']:,.2f}–{q['high']:,.2f}  ·  " if q["low"] and q["high"] else ""
+            items.append({"kind": "stock", "title": f"{q['symbol']}  {fmt_price(q)}",
+                          "subtitle": f"{q['name']}  ·  {q['exchange']}  ·  {day}{when}  ·  Enter for the chart",
+                          "icon": "utilities-system-monitor-symbolic", "hint": "Chart", "symbol": q["symbol"]})
+        top = quotes[0]["symbol"]
+        on = top in watching
+        items.insert(1, {"kind": "watch", "title": f"{'Remove' if on else 'Add'} {top} {'from' if on else 'to'} my stocks",
+                         "subtitle": "Your stocks show in the overview (click the top of the screen)",
+                         "icon": "list-remove-symbolic" if on else "list-add-symbolic", "hint": "",
+                         "symbol": top, "on": not on})
+        return items
 
     def show_items(self, items):
         self.items = items
@@ -3390,6 +4581,13 @@ class Guy:
                 self.do_intent(action, arg)
         elif kind == "claude":
             self.ask_claude(item["query"])
+        elif kind == "stock":
+            spawn("xdg-open", stock_url(item["symbol"]))
+            self.close_ask()
+        elif kind == "watch":
+            self.stocks.watch(item["symbol"], item["on"])
+            self.refresh(self.entry.get_text())
+            self.footer.set_label(f"{item['symbol']} {'added to' if item['on'] else 'removed from'} your stocks")
         elif kind == "web":
             spawn("xdg-open", "https://www.google.com/search?q=" + urllib.parse.quote_plus(item["query"]))
             self.close_ask()
@@ -3433,7 +4631,8 @@ class Guy:
         self.show_items(items)
         return False
 
-    def ask_claude(self, query, voice=False):
+    def ask_claude(self, query, voice=False, shown=None):
+        """shown: what the chat shows as your question, when the prompt itself is long (the news brief)."""
         query = query.strip()
         if not query and not self.attachment:
             return
@@ -3442,7 +4641,7 @@ class Guy:
         gen = self.claude_gen
         self.answer_text = ""
         self.last_query = query or "What is this file? Summarise it briefly."
-        label = self.ask_label = query or f"About {os.path.basename(self.attachment)}"
+        label = self.ask_label = shown or query or f"About {os.path.basename(self.attachment)}"
         self.answer_title.set_label(f"GUY  ·  {label}")
         self.chat_add(label)
         self.spinner.start()
@@ -3609,6 +4808,13 @@ class Guy:
                 pass
 
     def on_key(self, _ctrl, keyval, _code, state):
+        if self.floating and self.mode != "ask" and keyval == Gdk.KEY_Escape:
+            if self.mode == "home":              # a panel closes into the orb first; Esc again puts him back
+                self.user_mode = None
+                self.apply()
+            else:
+                self.dock()
+            return True
         if self.mode != "ask":
             return False
         ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
