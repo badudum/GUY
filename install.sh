@@ -66,7 +66,7 @@ declare -A NEED=(
     [python3]=python [/usr/lib/libgtk4-layer-shell.so]=gtk4-layer-shell
     [wl-copy]=wl-clipboard [playerctl]=playerctl [wpctl]=wireplumber [pw-play]=pipewire
     [fd]=fd [grim]=grim [notify-send]=libnotify [xdg-open]=xdg-utils [wtype]=wtype
-    [curl]=curl [unzip]=unzip
+    [curl]=curl [unzip]=unzip [secret-tool]=libsecret
 )
 missing=()
 for thing in "${!NEED[@]}"; do

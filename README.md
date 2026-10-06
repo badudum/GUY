@@ -7,7 +7,7 @@ none of Coucou's reserved assets (Mochi, sounds, icon) are used.
 
 | Do this | GUY does that |
 |---|---|
-| `Alt+Space` | grows into **Ask GUY** (apps, windows, math, stock prices, `Alt+F` files, `Tab` ask GUY, `Ctrl+Enter` web) |
+| `Alt+Space` | grows into **Ask GUY** (apps, files, windows, math, stock prices, `Tab` ask GUY, `Ctrl+Enter` web) |
 | `Esc` / click elsewhere | retracts straight back up into the top edge |
 | Hover the top-centre edge | peeks out |
 | Click the peek | opens the overview: Claude Code sessions, activity, routines, your stocks, the news |
@@ -83,8 +83,15 @@ whether he was out, across restarts.
 - **Stock prices**: type "google stock", "GOOGL price", "what's tesla trading at", "royal bank share price"
   or "$NVDA" for the live price, change and day range of the best matches. `Enter` opens the chart, and
   **Add to my stocks** puts it in the overview.
-- `Alt+F` searches your files, `Ctrl+Enter` searches the web, and dropping a file on the island asks
-  GUY about it.
+- **Files and folders** show up as you type, from an index of your home folder (plus `~/.config`) that
+  GUY keeps in memory: a search takes a few milliseconds. `Enter` opens one in its default app,
+  `Shift+Enter` shows it in its folder, and `Alt+F` lists only files. What you open often ranks higher, new
+  files in Desktop, Downloads, Documents and the like join at once, and the rest is re-indexed in the
+  background when the search opens and the index is 5 minutes old. Saying "open my resume" works too.
+  It skips hidden folders, anything `.gitignore`d or in `~/.config/fd/ignore`, and build junk
+  (node_modules, virtualenvs, Go's module cache); skip more, or add other places, in
+  `~/.config/guy/files.json`: `{"exclude": ["intelFPGA_lite"], "roots": ["/mnt/data"]}`.
+- `Ctrl+Enter` searches the web, and dropping a file on the island asks GUY about it.
 
 ## The overview
 
@@ -97,6 +104,7 @@ to show everything about it, with its buttons.
 | Claude Code sessions | read Claude's last reply, or see its folder and what it's doing |
 | Downloads, package runs, timers, tasks | open the file, or see the full status; **Cancel** a timer |
 | Reminders and routines | see the full text, next run and last run; **Run now**, **Last result**, **Cancel** |
+| Mail | today's unread mail in each Gmail account (the list scrolls); click one to open it in Gmail, **Brief me** for what needs you |
 | Stocks | each of your stocks with price, change and day range; click one for its chart |
 | News | the latest headlines; click one to read it, **Brief me** to have GUY sum them up |
 | Updates | the package list; **Update** opens kitty running `yay -Syu` |
@@ -119,6 +127,79 @@ or Atom feeds, or switch it off with `"feeds": []`, in `~/.config/guy/news.json`
 ```json
 {"feeds": ["https://www.cbc.ca/webfeed/rss/rss-topstories", "https://feeds.npr.org/1001/rss.xml"], "count": 6}
 ```
+
+### Mail
+
+GUY can keep an eye on any number of Gmail accounts. He only reads: the inbox is opened read-only, so
+nothing gets marked as read. The overview lists today's unread mail; only senders and subjects are ever
+sent to Claude (for **Brief me** and questions you ask), and only when you ask. For each account, turn on 2-Step Verification, create an app password at
+[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords), then:
+
+```sh
+guy --add-mail you@gmail.com --label Personal    # asks for the app password, checks it, keeps it in the keyring
+guy --add-mail you@work.com --label Work
+guy --mail                                       # print today's unread mail (--all for older too)
+guy --remove-mail you@work.com
+```
+
+Passwords are stored with `secret-tool` (your keyring, e.g. gnome-keyring), never in a file. GUY keeps a push
+connection (IMAP IDLE) open to each account, so new mail pops the pill out with a chime within seconds of
+landing (with a full check every 5 minutes as well). Ask GUY "any new mail?" lists it, and GUY's
+assistant can answer things like "anything from my bank?" from senders and subjects. By default only
+the Primary tab counts; change that with any Gmail search in `~/.config/guy/mail.json`:
+
+```json
+{"accounts": [...], "search": "is:unread in:inbox -category:promotions", "count": 8}
+```
+
+Work or school accounts need their admin to allow IMAP and app passwords.
+
+#### Google Calendar
+
+Ask GUY (or say) things like "lunch with Sam Friday 12:30 at Tacofino", "dentist on the 14th at 3pm for
+45 minutes", "put Mom's birthday in my calendar, every year" or "what's on my calendar tomorrow?", and he
+adds it to (or reads it from) your Google Calendar. He says back what he added; removing an event asks
+you first.
+
+Google doesn't let apps into Calendar with a password, so it takes a one-time setup with your own
+(free) Google Cloud project:
+
+1. At [console.cloud.google.com](https://console.cloud.google.com), create a project (call it GUY).
+2. **APIs & Services → Library**: find **Google Calendar API** and **Enable** it.
+3. **Google Auth Platform** (the OAuth consent screen): **Get started**, name it GUY, choose **External**,
+   and give your email. Under **Audience**, press **Publish app**: in "Testing" Google cuts GUY off
+   every 7 days.
+4. **Clients → Create client → Desktop app**, then download its JSON.
+5. Run `guy --add-calendar --client ~/Downloads/client_secret_….json --label Personal`. Your browser
+   opens: pick the account, and since the app is yours and unverified, click **Advanced → Go to GUY**,
+   then allow it. Link other accounts with `guy --add-calendar --label Work`.
+
+New events go to the first account you linked unless you name another ("…in my work calendar"). By hand:
+
+```sh
+guy --calendar [--days N]                     # what's coming up, in every linked account
+guy --cal-add "Lunch with Sam" "2026-10-09 12:30" [--for 1h30m | --end "…"] [--where Tacofino] \
+    [--notes "…"] [--repeat daily|weekdays|weekly|monthly|yearly] [--account Work]
+guy --cal-add "Trip" 2026-10-10 --end 2026-10-12 --all-day
+guy --cal-delete ID                           # ids are in guy --calendar
+guy --remove-calendar you@gmail.com
+```
+
+GUY only gets access to events (not your other Google data), and the token is kept in your keyring.
+
+#### Verification codes
+
+The same push connection hears about new mail in any tab, not just Primary. When a new email holds a sign-in or verification code, he finds it on your computer (the
+email is never sent anywhere), copies it, and shows it at the top: the code, who sent it and which account
+got it. If a browser has focus he also types it in, without pressing Enter. He doesn't type it into Gmail
+itself or into Ask GUY.
+
+Missed it, or want it again? Run `guy --code`, or type "code" in Ask GUY: the newest code from the last
+15 minutes, across all your accounts. Good on a key, e.g. in `hyprland.lua`:
+`hl.bind("SUPER + SHIFT + C", hl.dsp.exec_cmd(os.getenv("HOME") .. "/.local/bin/guy --code"))`.
+
+Switch the typing off with `"autofill": false` in `~/.config/guy/mail.json`, or the whole thing with
+`"codes": false` (new-mail notifications stay on).
 
 ## Reminders and routines
 
@@ -202,7 +283,7 @@ GUY is meant to sit there all day without costing anything: ~0.3% of one core wh
 
 ## Files
 
-- `guy`: the daemon (`guy`, `guy --ask`, `guy --install-hooks`, `guy --uninstall-hooks`)
+- `guy`: the daemon (`guy`, `guy --ask`, `guy --install-hooks`, `guy --uninstall-hooks`, `guy --add-mail`, `guy --mail`)
 - `guy-hook`: the relay Claude Code runs; talks to `$XDG_RUNTIME_DIR/guy.sock`
 - `guy-voice`: listening and speaking (runs in `~/.local/share/guy/venv`); `$XDG_RUNTIME_DIR/guy-voice.sock`
 - `guy-computer`: screenshots, clicks and typing for GUY's assistant (needs `wtype`, and `wlrctl` from the AUR to click)
@@ -215,6 +296,9 @@ GUY is meant to sit there all day without costing anything: ~0.3% of one core wh
 | File | What |
 |---|---|
 | `~/.config/guy/stocks.json` | your stocks (`{"watch": [...]}`) |
+| `~/.config/guy/mail.json` | your Gmail accounts and which mail counts (passwords are in the keyring) |
+| `~/.config/guy/calendar.json` | your linked Google Calendar accounts (tokens are in the keyring; the OAuth client is `google-client.json`) |
+| `~/.config/guy/files.json` | what the file search skips and where else it looks (`{"exclude": [...], "roots": [...]}`) |
 | `~/.config/guy/news.json` | news feeds and how many headlines (`{"feeds": [...], "count": 6}`) |
 | `~/.local/share/guy/schedule.json` | reminders and routines, with each routine's last result |
 | `~/.local/share/guy/memory.md` | what GUY remembers about you; edit it freely |

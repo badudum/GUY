@@ -78,7 +78,9 @@ SECRETS = (".ssh", ".gnupg", ".password-store", ".local/share/keyrings", ".pki",
 SECRET_RE = r"(~|\$HOME|" + re.escape(HOME) + r")/(" + "|".join(re.escape(x) for x in SECRETS) + r")\b"
 RISKY_COMMANDS = [
     (SECRET_RE, "read your keys or passwords"),
+    (r"\bsecret-tool\b", "read your keys or passwords"),
     (r"\bguy-computer\s+send-key\b", "send a message from your computer"),
+    (r"\bguy\s+--(cal-delete|remove-calendar)\b", "delete from your calendar"),
     (r"\b(rm|rmdir|shred|unlink|srm|trash-empty)\b|\bfind\b.*\s-delete\b|\bgit\s+(clean|reset\s+--hard|checkout\s+--|restore)\b",
      "delete files"),
     (r"\b(sudo|doas|pkexec|run0|su)\b", "run something as root"),
@@ -89,7 +91,7 @@ RISKY_COMMANDS = [
      r"hyprctl\s+(dispatch\s+exit|keyword)|modprobe|rmmod|ufw|iptables|nft)\b|\bchmod\s+-R\b",
      "change system settings"),
     (r"\bcurl\b.*\s(-d|--data\S*|-F|--form|-T|--upload-file|-X\s*(POST|PUT|PATCH|DELETE))\b|\bwget\b.*--post"
-     r"|\b(scp|rsync|sftp|ftp|ssh|nc|ncat|socat|mail|mailx|sendmail|mutt|msmtp)\b|\bgit\s+push\b"
+     r"|(?<!-)\b(scp|rsync|sftp|ftp|ssh|nc|ncat|socat|mail|mailx|sendmail|mutt|msmtp)\b|\bgit\s+push\b"
      r"|\bgh\s+(pr|issue|release|repo|gist|api)\b", "send something off this laptop"),
 ]
 

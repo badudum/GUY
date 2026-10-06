@@ -34,6 +34,15 @@ if sys.argv[1:2] in (["--listen"], ["--voice"]):
         sys.exit(1)
     sys.exit(0)
 
+# Dress him by hand (otherwise he dresses for the weather outside): guy --outfit rain|sunny|cold|plain|auto
+if sys.argv[1:2] == ["--outfit"]:
+    try:
+        _send({"guy_command": "outfit", "outfit": (sys.argv[2:3] or ["auto"])[0]})
+    except OSError:
+        print("guy: GUY isn't running", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
 # Reminders and routines, for you and for GUY's assistant (which sets them by running these):
 #   guy --remind "17:00" "call mom" [--every daily|weekdays|weekly|hourly]
 #   guy --task "08:30" "give me a morning brief: weather, calendar, news" --every weekdays
@@ -139,9 +148,701 @@ if sys.argv[1:2] in (["--remind"], ["--task"], ["--schedule"], ["--unschedule"])
         pass
     sys.exit(0)
 
+# Gmail, read-only over IMAP with an app password per account. The accounts are listed in
+# ~/.config/guy/mail.json, their passwords live in the keyring (secret-tool), and nothing is ever
+# marked as read: the inbox is opened read-only and only the sender, subject and date are fetched.
+#   guy --add-mail you@gmail.com [--label Work]   asks for the app password, checks it, stores it
+#   guy --remove-mail you@gmail.com               guy --mail [--count N]   print the unread mail
+MAIL_CONFIG = os.path.join(os.path.expanduser("~"), ".config/guy/mail.json")
+MAIL_HOST = "imap.gmail.com"
+MAIL_SEARCH = "is:unread category:primary"   # Gmail search: the Primary tab, not every unread promotion
+MAIL_COUNT = 30                               # the newest this many are listed (it scrolls)
+
+
+def mail_accounts():
+    """([{"address", "label"}], the whole config)."""
+    import json
+    try:
+        with open(MAIL_CONFIG) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    return [a for a in cfg.get("accounts", []) if isinstance(a, dict) and a.get("address")], cfg
+
+
+def save_mail_accounts(accounts, cfg):
+    import json
+    os.makedirs(os.path.dirname(MAIL_CONFIG), exist_ok=True)
+    cfg["accounts"] = accounts
+    with open(MAIL_CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def mail_label(account):
+    return account.get("label") or account["address"].split("@")[0]
+
+
+def mail_password(address):
+    """The app password from the keyring (which may ask to be unlocked), or None."""
+    import subprocess
+    r = subprocess.run(["secret-tool", "lookup", "service", "guy-mail", "account", address],
+                       capture_output=True, text=True, timeout=120)
+    return r.stdout.strip() or None
+
+
+def mail_link(address, thread=None):
+    import urllib.parse
+    url = "https://mail.google.com/mail/?authuser=" + urllib.parse.quote(address)
+    return url + (f"#all/{thread:x}" if thread else "#inbox")
+
+
+def mail_query(search, today=True):
+    """`search` as a quoted X-GM-RAW argument; with `today`, only what arrived since midnight."""
+    if today:                                    # Gmail takes a Unix time: midnight here, not in UTC
+        import datetime as dt
+        search += f" after:{int(dt.datetime.combine(dt.date.today(), dt.time()).timestamp())}"
+    return '"' + search.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def mail_headers(m, address, uids):
+    """[{"uid", "when", "sender", "subject", "link"}] for these UIDs (bytes or str) of a selected mailbox."""
+    import email
+    import email.header
+    import email.utils
+    import re
+
+    def text(raw):
+        try:
+            return str(email.header.make_header(email.header.decode_header(raw or ""))).strip()
+        except (LookupError, UnicodeError, ValueError):
+            return (raw or "").strip()
+
+    out = []
+    if not uids:
+        return out
+    _t, data = m.uid("FETCH", ",".join(u.decode() if isinstance(u, bytes) else str(u) for u in uids),
+                     "(X-GM-THRID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+    for part in data:
+        if not isinstance(part, tuple):
+            continue
+        meta = part[0].decode(errors="replace")
+        uid, thread = re.search(r"UID (\d+)", meta), re.search(r"X-GM-THRID (\d+)", meta)
+        msg = email.message_from_bytes(part[1])
+        name, addr = email.utils.parseaddr(text(msg["From"]))
+        try:
+            when = email.utils.parsedate_to_datetime(msg["Date"]).timestamp()
+        except (TypeError, ValueError):
+            when = 0.0
+        out.append({"uid": uid.group(1) if uid else meta, "when": when, "sender": name or addr,
+                    "subject": text(msg["Subject"]) or "(no subject)",
+                    "link": mail_link(address, int(thread.group(1)) if thread else None)})
+    return sorted(out, key=lambda x: -x["when"])
+
+
+def fetch_mail(address, password, search=MAIL_SEARCH, count=MAIL_COUNT, today=True):
+    """(how many match `search` in the inbox, [the newest `count` of them as {"uid", "when", "sender",
+    "subject", "link"}], newest first). With `today`, only what arrived since midnight."""
+    import imaplib
+
+    with imaplib.IMAP4_SSL(MAIL_HOST, timeout=20) as m:
+        m.login(address, password)
+        m.select("INBOX", readonly=True)
+        _t, data = m.uid("SEARCH", None, "X-GM-RAW", mail_query(search, today))
+        uids = data[0].split() if data and data[0] else []
+        return len(uids), mail_headers(m, address, uids[-count:])
+
+
+def mail_labels(accounts):
+    """address -> the name to show: its label, or the address itself when several accounts share a label."""
+    names = [mail_label(a) for a in accounts]
+    return {a["address"]: n if names.count(n) == 1 else a["address"] for a, n in zip(accounts, names)}
+
+
+# ---------- verification codes in new mail ----------
+CODE_HINT = r"verif\w*|confirm\w*|one[- ]?time|otp|pass ?code|security code|sign[- ]?in|log ?in|2fa|" \
+            r"two[- ](?:factor|step)|authenticat\w*|code|pin"
+CODE_KEY = r"(?:code|passcode|otp|pin)\b"     # a code usually follows one of these closely
+
+
+def message_text(msg):
+    """The readable text of an email.message.EmailMessage (default policy): plain text, or HTML stripped."""
+    import html
+    import re
+    part = msg.get_body(preferencelist=("plain", "html"))
+    if part is None:
+        return ""
+    try:
+        text = part.get_content()
+    except (LookupError, UnicodeError, ValueError):
+        return ""
+    if part.get_content_type() == "text/html":
+        text = re.sub(r"(?is)<(style|script|head)\b.*?</\1>", " ", text)
+        text = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|td|h\d|li)>", "\n", text)
+        text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    return text
+
+
+def find_code(subject, text):
+    """The verification code in an email, or None: 4-8 digits (or "123 456"), or 5-8 capitals and digits
+    right after "code". Scored by how close it sits to "code" (before or after it), its length, and
+    whether the subject has it; years, prices, order numbers and promo codes don't count."""
+    import re
+    subject, text = subject or "", (text or "")[:6000]
+    if not re.search(rf"\b(?:{CODE_HINT})\b", subject + " " + text[:3000], re.I):
+        return None
+    best = None
+    for where, body in ((0, subject), (1, text)):
+        flat = re.sub(r"\s+", " ", body)
+        for m in re.finditer(r"(?<![\w.,/:#$€£@+])(\d{3}[ -]\d{3}|\d{4,8}|[A-Z0-9]{5,8})(?![\w/%@]|[.,]\d)", flat):
+            code = re.sub(r"[ -]", "", m.group(1))
+            before, after = flat[max(0, m.start() - 60):m.start()], flat[m.end():m.end() + 40]
+            right_after_key = re.search(rf"\b{CODE_KEY}", before[-30:], re.I)
+            if re.search(r"promo|coupon|discount|voucher|referral|gift|% off|\boff\b", before[-40:] + after, re.I):
+                continue
+            if not code.isdigit():
+                # letters and digits: only right after "code", and with both in it
+                if not (right_after_key and re.search(r"\d", code) and re.search(r"[A-Z]", code)):
+                    continue
+            elif len(code) < 5 and 1900 <= int(code) <= 2099 and not right_after_key:
+                continue                         # a year
+            if re.search(rf"\b{CODE_KEY}", before, re.I) or re.search(rf"^\W{{0,25}}(?:is |are )?(?:your |the )?"
+                                                                    rf"(?:[\w-]+ ){{0,3}}{CODE_KEY}", after, re.I):
+                score = 3
+            elif re.search(rf"\b(?:{CODE_HINT})\b", before[-25:] + " " + after[:25], re.I):
+                score = 1                        # "verify" or "sign in" right next to it
+            else:
+                score = 0
+            score += (2 if len(code) == 6 else 1 if len(code) in (4, 5, 8) else 0) + (1 if where == 0 else 0) \
+                + (1 if right_after_key else 0)
+            if score >= 3 and (best is None or score > best[0]):
+                best = (score, code)
+    return best[1] if best else None
+
+
+def recent_code(address, password, minutes=15):
+    """The newest code in mail that reached the inbox in the last `minutes`: (code, sender, received) or None."""
+    import datetime as dt
+    import email
+    import email.policy
+    import email.utils
+    import imaplib
+    import time as _t
+    with imaplib.IMAP4_SSL(MAIL_HOST, timeout=20) as m:
+        m.login(address, password)
+        m.select("INBOX", readonly=True)
+        since = (dt.date.today() - dt.timedelta(days=1)).strftime("%d-%b-%Y")
+        _t2, data = m.uid("SEARCH", None, "SINCE", since)
+        uids = data[0].split() if data and data[0] else []
+        for uid in reversed(uids[-15:]):
+            _t2, data = m.uid("FETCH", uid.decode(), "(INTERNALDATE RFC822.SIZE BODY.PEEK[])")
+            part = next((p for p in data if isinstance(p, tuple)), None)
+            if not part:
+                continue
+            got = imaplib.Internaldate2tuple(part[0])
+            received = _t.mktime(got) if got else 0.0
+            if _t.time() - received > minutes * 60:
+                break                            # older than that: so is everything before it
+            msg = email.message_from_bytes(part[1], policy=email.policy.default)
+            code = find_code(str(msg["Subject"] or ""), message_text(msg))
+            if code:
+                name, addr = email.utils.parseaddr(str(msg["From"] or ""))
+                return code, name or addr, received
+    return None
+
+
+def mail_error(e):
+    """A short reason an account couldn't be checked."""
+    import imaplib
+    if isinstance(e, imaplib.IMAP4.error):
+        return "Gmail refused the sign-in (wrong app password, or IMAP is off for this account)"
+    if isinstance(e, OSError):
+        return "couldn't reach Gmail"
+    return f"couldn't check: {e}"
+
+
+# guy --code: the newest verification code from your mail, copied (and typed into the browser when it
+# has focus). A running GUY does it, so the island shows it; otherwise it's printed and copied here.
+if sys.argv[1:] == ["--code"]:
+    try:
+        _send({"guy_command": "code"})
+        sys.exit(0)
+    except OSError:
+        import subprocess
+        for _acc in mail_accounts()[0]:
+            try:
+                _hit = recent_code(_acc["address"], mail_password(_acc["address"]) or "")
+            except Exception:  # noqa: BLE001 - try the next account
+                continue
+            if _hit:
+                subprocess.run(["wl-copy", "--", _hit[0]])
+                print(f"{_hit[0]}  (copied; from {_hit[1]} to {_acc['address']})")
+                sys.exit(0)
+        print("No verification code in the last 15 minutes.", file=sys.stderr)
+        sys.exit(1)
+
+if sys.argv[1:2] in (["--add-mail"], ["--remove-mail"], ["--mail"]):
+    import argparse
+    import getpass
+    import shutil
+    import subprocess
+    import time as _time
+    _cmd = sys.argv[1][2:]
+    _ap = argparse.ArgumentParser(prog=f"guy --{_cmd}")
+    if _cmd == "mail":
+        _ap.add_argument("--count", type=int, default=10, help="messages to show per account")
+        _ap.add_argument("--all", action="store_true", help="all unread mail, not just today's")
+    else:
+        _ap.add_argument("address")
+    if _cmd == "add-mail":
+        _ap.add_argument("--label", help='a short name shown on the island, e.g. "Work"')
+    _a = _ap.parse_args(sys.argv[2:])
+    if not shutil.which("secret-tool"):
+        print("guy: needs secret-tool (sudo pacman -S libsecret) and a keyring such as gnome-keyring",
+              file=sys.stderr)
+        sys.exit(1)
+    _accounts, _cfg = mail_accounts()
+    if _cmd == "mail":
+        if _accounts and not _a.all:
+            print("Unread mail from today (guy --mail --all for everything)\n")
+        if not _accounts:
+            print("No mail accounts. Add one with: guy --add-mail you@gmail.com")
+        for _acc in _accounts:
+            try:
+                _pw = mail_password(_acc["address"])
+                if not _pw:
+                    raise RuntimeError(f"no password in the keyring (guy --add-mail {_acc['address']})")
+                _n, _msgs = fetch_mail(_acc["address"], _pw, _cfg.get("search", MAIL_SEARCH), _a.count, not _a.all)
+            except Exception as _e:  # noqa: BLE001 - say why, and go on to the next account
+                print(f"{mail_label(_acc)}  <{_acc['address']}>  {mail_error(_e)}\n")
+                continue
+            print(f"{mail_label(_acc)}  <{_acc['address']}>  {_n} unread{'' if _a.all else ' today'}")
+            for _m in _msgs:
+                _when = _time.strftime("%a %d %b %H:%M", _time.localtime(_m["when"])) if _m["when"] else "?"
+                print(f"  {_when}  {_m['sender']}: {_m['subject']}\n      {_m['link']}")
+            print()
+        sys.exit(0)
+    _addr = _a.address.strip().lower()
+    if _cmd == "remove-mail":
+        subprocess.run(["secret-tool", "clear", "service", "guy-mail", "account", _addr])
+        save_mail_accounts([x for x in _accounts if x["address"] != _addr], _cfg)
+        print(f"Removed {_addr}.")
+    else:
+        print(f"Create an app password for {_addr} at https://myaccount.google.com/apppasswords\n"
+              "(it needs 2-Step Verification on). GUY only reads, and never marks anything as read.")
+        _pw = getpass.getpass("App password: ").replace(" ", "").strip()
+        if not _pw:
+            sys.exit(1)
+        try:
+            _n, _msgs = fetch_mail(_addr, _pw, _cfg.get("search", MAIL_SEARCH), 1)
+        except Exception as _e:  # noqa: BLE001
+            print(f"guy: {mail_error(_e)}. Nothing saved.", file=sys.stderr)
+            sys.exit(1)
+        _r = subprocess.run(["secret-tool", "store", "--label", f"GUY mail: {_addr}",
+                             "service", "guy-mail", "account", _addr], input=_pw, text=True)
+        if _r.returncode:
+            print("guy: couldn't save the password in the keyring", file=sys.stderr)
+            sys.exit(1)
+        _old = next((x for x in _accounts if x["address"] == _addr), {})
+        _acc = {"address": _addr, "label": _a.label or _old.get("label") or _addr.split("@")[0]}
+        save_mail_accounts([x for x in _accounts if x["address"] != _addr] + [_acc], _cfg)
+        print(f"Added {_addr} as “{_acc['label']}”: {_n} unread.")
+    try:
+        _send({"guy_command": "mail"})
+    except OSError:
+        pass
+    sys.exit(0)
+
 # Any script can put a live activity on the island, e.g.
 #   guy --activity backup --title "Backing up" --detail "photos" --progress 0.4
 #   guy --activity backup --title "Backup finished" --done --open ~/Backups
+# Google Calendar, over its API with your own OAuth client (Google allows no passwords for it). One-time
+# setup is in the README; then each account is linked in the browser, and its token kept in the keyring.
+#   guy --add-calendar [--client client_secret.json] [--label Work]   link an account (opens the browser)
+#   guy --remove-calendar ADDR      guy --calendar [--days N]   what's coming up, in every linked account
+#   guy --cal-add "TITLE" "WHEN" [--end WHEN | --for 1h30m] [--all-day] [--where PLACE] [--notes TEXT]
+#                 [--repeat daily|weekdays|weekly|monthly|yearly] [--account ADDR]
+#   guy --cal-delete ID [--account ADDR]
+# WHEN is anything guy --remind takes; for a date, "YYYY-MM-DD" (with --all-day).
+CAL_CONFIG = os.path.join(os.path.expanduser("~"), ".config/guy/calendar.json")
+CAL_CLIENT = os.path.join(os.path.expanduser("~"), ".config/guy/google-client.json")
+CAL_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+CAL_API = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+CAL_REPEAT = {"daily": "FREQ=DAILY", "weekdays": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", "weekly": "FREQ=WEEKLY",
+              "monthly": "FREQ=MONTHLY", "yearly": "FREQ=YEARLY"}
+
+
+class CalendarError(Exception):
+    pass
+
+
+def cal_accounts():
+    import json
+    try:
+        with open(CAL_CONFIG) as f:
+            return json.load(f).get("accounts", [])
+    except (OSError, ValueError):
+        return []
+
+
+def save_cal_accounts(accounts):
+    import json
+    os.makedirs(os.path.dirname(CAL_CONFIG), exist_ok=True)
+    with open(CAL_CONFIG + ".tmp", "w") as f:
+        json.dump({"accounts": accounts}, f, indent=1)
+    os.replace(CAL_CONFIG + ".tmp", CAL_CONFIG)
+
+
+def cal_client():
+    """(client id, client secret) from the OAuth client JSON Google gave you."""
+    import json
+    try:
+        with open(CAL_CLIENT) as f:
+            c = json.load(f)
+        c = c.get("installed") or c.get("web") or c
+        return c["client_id"], c["client_secret"]
+    except (OSError, ValueError, KeyError):
+        raise CalendarError("no Google OAuth client yet: see Google Calendar in GUY's README, then run "
+                            "guy --add-calendar --client ~/Downloads/client_secret_….json") from None
+
+
+def google_post(url, fields):
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, urllib.parse.urlencode(fields).encode(), timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.load(e)
+        except ValueError:
+            err = {}
+        raise CalendarError(err.get("error_description") or err.get("error") or f"Google said {e.code}") from None
+    except OSError:
+        raise CalendarError("couldn't reach Google") from None
+
+
+def cal_token(address):
+    """A fresh access token for `address`, from the refresh token in the keyring."""
+    import subprocess
+    r = subprocess.run(["secret-tool", "lookup", "service", "guy-calendar", "account", address],
+                       capture_output=True, text=True)
+    if not r.stdout.strip():
+        raise CalendarError(f"{address} isn't linked: run guy --add-calendar")
+    cid, secret = cal_client()
+    try:
+        return google_post("https://oauth2.googleapis.com/token", {
+            "client_id": cid, "client_secret": secret, "refresh_token": r.stdout.strip(),
+            "grant_type": "refresh_token"})["access_token"]
+    except CalendarError as e:
+        if "invalid_grant" in str(e) or "expired" in str(e).lower() or "revoked" in str(e).lower():
+            raise CalendarError(f"Google ended GUY's access to {address}: run guy --add-calendar again") from None
+        raise
+
+
+def cal_api(token, method, url, body=None):
+    import json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.load(e)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            msg = f"Google said {e.code}"
+        raise CalendarError(msg) from None
+    except OSError:
+        raise CalendarError("couldn't reach Google Calendar") from None
+
+
+def cal_link():
+    """Sign in in the browser (a loopback redirect, with PKCE); returns (address, refresh token)."""
+    import base64
+    import hashlib
+    import http.server
+    import json
+    import secrets
+    import subprocess
+    import time
+    import urllib.parse
+    cid, secret = cal_client()
+    verifier = secrets.token_urlsafe(64)
+    state = secrets.token_urlsafe(16)
+    got = {}
+
+    class Back(http.server.BaseHTTPRequestHandler):
+        timeout = 10                             # drop sockets browsers open ahead and never use
+
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if q.get("state", [""])[0] == state:
+                got.update({k: v[0] for k, v in q.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("<p style='font:16px sans-serif;margin:3em'>GUY has your calendar. You can close this tab.</p>"
+                             .encode() if "code" in got else b"<p>That didn't work; try guy --add-calendar again.</p>")
+
+        def log_message(self, *_a):
+            pass
+
+    # threaded: Chrome and Firefox open a spare connection first, and a one-at-a-time server would sit
+    # waiting on it while the real redirect queues behind
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Back)
+    server.daemon_threads = True
+    server.timeout = 1                           # wake to see whether a handler thread got the code
+    redirect = f"http://127.0.0.1:{server.server_port}"
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": cid, "redirect_uri": redirect, "response_type": "code", "scope": "openid email " + CAL_SCOPE,
+        "access_type": "offline", "prompt": "consent", "state": state, "code_challenge_method": "S256",
+        "code_challenge": base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()})
+    print("Sign in to Google in your browser (and pick the account to link). If it didn't open:\n" + url)
+    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 300
+    while "code" not in got and "error" not in got and time.monotonic() < deadline:
+        server.handle_request()                  # the browser may ask for other things (a favicon) first
+    server.server_close()
+    if "code" not in got:
+        raise CalendarError(got.get("error", "no answer from the browser in 5 minutes"))
+    tok = google_post("https://oauth2.googleapis.com/token", {
+        "client_id": cid, "client_secret": secret, "code": got["code"], "code_verifier": verifier,
+        "redirect_uri": redirect, "grant_type": "authorization_code"})
+    if "refresh_token" not in tok:
+        raise CalendarError("Google gave no lasting access; remove GUY at myaccount.google.com/permissions and retry")
+    # which account they picked: the id token, straight from Google over TLS, says
+    claims = tok["id_token"].split(".")[1]
+    address = json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))["email"]
+    return address, tok["refresh_token"]
+
+
+def cal_when(text, all_day=False):
+    """A datetime (or a date, with all_day) from WHEN, as guy --remind takes it, or a bare YYYY-MM-DD."""
+    import datetime as dt
+    import re
+    if all_day:
+        t = text.strip().lower()
+        if t in ("today", "tomorrow"):
+            return dt.date.today() + dt.timedelta(days=t == "tomorrow")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+            return dt.date.fromisoformat(t)
+        return parse_when(text).date()
+    return parse_when(text)
+
+
+def cal_span(text):
+    """'1h30m', '90m', '2h', '45 minutes' -> a timedelta."""
+    import datetime as dt
+    import re
+    parts = re.findall(r"(\d+(?:\.\d+)?)\s*(h|hours?|hrs?|m|mins?|minutes?)", text.lower())
+    if not parts:
+        raise CalendarError(f"not a length of time: {text!r} (say 1h30m)")
+    return dt.timedelta(minutes=sum(float(n) * (60 if u[0] == "h" else 1) for n, u in parts))
+
+
+def cal_fmt(ev):
+    """One line for an event: when, what, where."""
+    import datetime as dt
+    s, e = ev.get("start", {}), ev.get("end", {})
+    if "date" in s:
+        d0, d1 = dt.date.fromisoformat(s["date"]), dt.date.fromisoformat(e["date"]) - dt.timedelta(days=1)
+        when = f"{d0:%a %b %-d}" + (f"–{d1:%a %b %-d}" if d1 > d0 else "") + ", all day"
+    else:
+        t0 = dt.datetime.fromisoformat(s["dateTime"]).astimezone()
+        t1 = dt.datetime.fromisoformat(e["dateTime"]).astimezone()
+        when = f"{t0:%a %b %-d %H:%M}–" + (f"{t1:%H:%M}" if t1.date() == t0.date() else f"{t1:%a %b %-d %H:%M}")
+    where = f"  @ {ev['location']}" if ev.get("location") else ""
+    return f"{when}  {ev.get('summary') or '(no title)'}{where}"
+
+
+if sys.argv[1:2] in (["--add-calendar"], ["--remove-calendar"], ["--calendar"], ["--cal-add"], ["--cal-delete"]):
+    import argparse
+    import datetime as _dt
+    import shutil as _sh
+    import subprocess as _sp
+    import urllib.parse as _up
+    _cmd = sys.argv[1][2:]
+    _ap = argparse.ArgumentParser(prog=f"guy --{_cmd}")
+    _accounts = cal_accounts()
+    if _cmd == "add-calendar":
+        _ap.add_argument("--client", help="the OAuth client JSON downloaded from Google Cloud")
+        _ap.add_argument("--label")
+    elif _cmd == "remove-calendar":
+        _ap.add_argument("address")
+    elif _cmd == "calendar":
+        _ap.add_argument("--days", type=int, default=7)
+    elif _cmd == "cal-add":
+        _ap.add_argument("title")
+        _ap.add_argument("when")
+        _ap.add_argument("--end")
+        _ap.add_argument("--for", dest="span")
+        _ap.add_argument("--all-day", action="store_true")
+        _ap.add_argument("--where")
+        _ap.add_argument("--notes")
+        _ap.add_argument("--repeat", choices=CAL_REPEAT)
+        _ap.add_argument("--account")
+    else:
+        _ap.add_argument("id")
+        _ap.add_argument("--account")
+    _a = _ap.parse_args(sys.argv[2:])
+
+    def _pick(address):
+        if not _accounts:
+            raise CalendarError("no calendar linked yet: run guy --add-calendar")
+        if not address:
+            return _accounts[0]["address"]
+        hit = [x for x in _accounts if address.lower() in (x["address"].lower(), (x.get("label") or "").lower())]
+        if not hit:
+            raise CalendarError(f"{address} isn't linked; linked: " + ", ".join(x["address"] for x in _accounts))
+        return hit[0]["address"]
+
+    try:
+        if _cmd == "add-calendar":
+            if _a.client:
+                os.makedirs(os.path.dirname(CAL_CLIENT), exist_ok=True)
+                _sh.copyfile(os.path.expanduser(_a.client), CAL_CLIENT)
+                os.chmod(CAL_CLIENT, 0o600)
+            _addr, _refresh = cal_link()
+            _r = _sp.run(["secret-tool", "store", "--label", f"GUY calendar: {_addr}",
+                          "service", "guy-calendar", "account", _addr], input=_refresh, text=True)
+            if _r.returncode:
+                raise CalendarError("couldn't store the token in the keyring (is gnome-keyring running?)")
+            save_cal_accounts([x for x in _accounts if x["address"] != _addr]
+                              + [{"address": _addr, **({"label": _a.label} if _a.label else {})}])
+            print(f"Linked {_addr}'s Google Calendar." + ("" if _accounts else " New events go here unless you say --account."))
+        elif _cmd == "remove-calendar":
+            _sp.run(["secret-tool", "clear", "service", "guy-calendar", "account", _a.address])
+            save_cal_accounts([x for x in _accounts if x["address"] != _a.address])
+            print(f"Unlinked {_a.address}. (Also remove GUY at myaccount.google.com/permissions to revoke it there.)")
+        elif _cmd == "calendar":
+            if not _accounts:
+                raise CalendarError("no calendar linked yet: run guy --add-calendar")
+            _now = _dt.datetime.now().astimezone()
+            _q = _up.urlencode({"timeMin": _now.isoformat(), "timeMax": (_now + _dt.timedelta(days=_a.days)).isoformat(),
+                                "singleEvents": "true", "orderBy": "startTime", "maxResults": 50})
+            for _acc in _accounts:
+                print(f"{_acc.get('label') or _acc['address']}  <{_acc['address']}>  next {_a.days} days")
+                try:
+                    _evs = cal_api(cal_token(_acc["address"]), "GET", f"{CAL_API}?{_q}").get("items", [])
+                except CalendarError as _e:
+                    print(f"  {_e}\n")
+                    continue
+                for _ev in _evs:
+                    print(f"  {cal_fmt(_ev)}   id: {_ev['id']}")
+                print("  (nothing)\n" if not _evs else "")
+        elif _cmd == "cal-add":
+            _addr = _pick(_a.account)
+            try:
+                _start = cal_when(_a.when, _a.all_day)
+                _end = cal_when(_a.end, _a.all_day) if _a.end else None
+            except ValueError as _e:
+                raise CalendarError(str(_e)) from None
+            if _a.all_day:
+                _end = (_end or _start) + _dt.timedelta(days=1)    # Google's end date is exclusive
+                _body = {"start": {"date": _start.isoformat()}, "end": {"date": _end.isoformat()}}
+            else:
+                _end = _end or _start + (cal_span(_a.span) if _a.span else _dt.timedelta(hours=1))
+                if _end <= _start:
+                    raise CalendarError("it ends before it starts")
+                _body = {"start": {"dateTime": _start.astimezone().isoformat()},
+                         "end": {"dateTime": _end.astimezone().isoformat()}}
+            _body["summary"] = _a.title
+            if _a.where:
+                _body["location"] = _a.where
+            if _a.notes:
+                _body["description"] = _a.notes
+            if _a.repeat:
+                _body["recurrence"] = ["RRULE:" + CAL_REPEAT[_a.repeat]]
+            _ev = cal_api(cal_token(_addr), "POST", CAL_API, _body)
+            print(f"Added to {_addr}: {cal_fmt(_ev)}" + (f", repeating {_a.repeat}" if _a.repeat else "")
+                  + f"\nid: {_ev['id']}\n{_ev.get('htmlLink', '')}")
+        else:
+            _addr = _pick(_a.account)
+            _tok = cal_token(_addr)
+            _ev = cal_api(_tok, "GET", f"{CAL_API}/{_up.quote(_a.id)}")
+            cal_api(_tok, "DELETE", f"{CAL_API}/{_up.quote(_a.id)}")
+            print(f"Deleted from {_addr}: {cal_fmt(_ev)}")
+    except CalendarError as _e:
+        print(f"guy: {_e}", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+# ---------- files and folders, indexed ----------
+# Everything under your home (not hidden, minus what's .gitignored, ~/.config/fd/ignore, and the build
+# junk below) plus ~/.config, kept in memory so each keystroke searches it in a few milliseconds.
+# ~/.config/guy/files.json: {"exclude": ["intelFPGA_lite", ...], "roots": ["/mnt/data"]} (fd globs).
+FILES_CONFIG = os.path.expanduser("~/.config/guy/files.json")
+FILES_OPENED = os.path.expanduser("~/.cache/guy/opened.json")
+FILES_EXCLUDE = ["node_modules", "__pycache__", "site-packages", ".venv", "venv", "__MACOSX", "/go/pkg",
+                 "*.pyc", "*.o"]
+FILES_STALE = 300                 # seconds before opening the search rebuilds the index (in the background)
+FILES_CAP = 1000                  # candidates per search term, best kinds of match first
+FILES_WATCH = ("", "Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music", "Desktop/Projects")
+_FILE_SEPS = bytes.maketrans(b" _.-([", b"\1" * 6)
+
+
+def file_key(name):
+    """A name as the index keeps it: lowercase, with every word break as \\1."""
+    return name.decode(errors="surrogateescape").lower().encode(errors="surrogateescape").translate(_FILE_SEPS)
+
+
+def index_files():
+    """The six blobs FileIndex searches: every path ("\\0"-separated, folders ending in "/"), where each
+    starts, each name once (file_key, sorted), where each starts, the entries in name order, and where
+    each name's run of entries starts in that order. Bytes, not str: one name with an accent would make a
+    str 4 bytes a character, and bytes.find is several times faster. Runs as its own process
+    (guy --index-files), so its Python loops never hold up GUY's."""
+    import array
+    import json
+    import re
+    import subprocess
+    home = os.path.expanduser("~")
+    try:
+        with open(FILES_CONFIG) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    ex = [a for e in FILES_EXCLUDE + list(cfg.get("exclude", [])) for a in ("-E", e)]
+    out = []
+    for cmd in (["fd", "--threads", "4", "-0", *ex, ".", home, *cfg.get("roots", [])],
+                ["fd", "--threads", "2", "-0", "-H", "--max-depth", "4", *ex, "-E", ".git", ".", home + "/.config"]):
+        try:
+            out.append(subprocess.run(cmd, capture_output=True, timeout=60).stdout)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    paths = b"\0" + b"".join(out)              # every entry between two \0s
+    if len(paths) < 2:
+        return [b"", b"", b"", b"", b"", b""]
+    entries = paths[1:-1].split(b"\0")
+    starts = array.array("I", (m.end() for m in re.finditer(b"\0", paths)))
+    starts.pop()                                 # the last \0 ends the last entry
+    keys = [file_key(e[e.rfind(b"/", 0, len(e) - 1) + 1:].rstrip(b"/")) for e in entries]
+    del entries
+    # each name once (README.md is in hundreds of folders), sorted, with the entries that have it
+    order = array.array("I", sorted(range(len(keys)), key=keys.__getitem__))
+    names, nstarts, runs, last, pos = [b""], array.array("I"), array.array("I"), None, 1
+    for j, i in enumerate(order):
+        if keys[i] != last:
+            last = keys[i]
+            names.append(last)
+            nstarts.append(pos)
+            runs.append(j)
+            pos += len(last) + 1
+    runs.append(len(order))
+    return [paths, starts.tobytes(), b"\0".join(names) + b"\0", nstarts.tobytes(), order.tobytes(), runs.tobytes()]
+
+
+if sys.argv[1:] == ["--index-files"]:
+    import struct
+    _parts = index_files()
+    sys.stdout.buffer.write(struct.pack("6Q", *map(len, _parts)) + b"".join(_parts))
+    sys.exit(0)
+
 if sys.argv[1:2] == ["--activity"]:
     import argparse
     _ap = argparse.ArgumentParser(prog="guy --activity", description="Show a live activity on GUY's island.")
@@ -190,6 +891,8 @@ else:
 #   guy --activity ID ...  show a live activity from any script (guy --activity --help)
 #   guy --listen           talk to GUY now (Super+Space); saying "Hey GUY" does the same (guy-voice)
 #   guy --voice on|off     switch "Hey GUY" listening on or off (the microphone closes when off)
+#   guy --add-mail ADDR    let GUY read a Gmail account (an app password, kept in the keyring)
+#   guy --code             copy (and type in) the newest verification code from your mail
 #
 # Besides Claude Code it follows browser downloads (~/Downloads), pacman / yay as they run
 # (/var/log/pacman.log), and the number of available updates (HyDE's `hyde-shell system.update`).
@@ -200,6 +903,7 @@ else:
 # to call mom", "cancel timer", and several at once ("lower sound and next song").
 
 import ast
+import bisect
 import difflib
 import json
 import math
@@ -255,7 +959,7 @@ GLASS = {
     "shadow_alpha": 0.32, "shadow_range": 52, "shadow_power": 2.2, "shadow_offset": 8,
 }
 SHADOW_PAD = 52 + 18 + 12
-MAX_APPS, MAX_WINDOWS, MAX_FILES = 6, 3, 60
+MAX_APPS, MAX_WINDOWS, MAX_FILES, MAX_FILES_INLINE = 6, 3, 60, 4
 
 WEB_TOOLS = ["WebSearch", "WebFetch"]
 TOOL_STATUS = {"WebSearch": "searching the web…", "WebFetch": "reading a page…", "Read": "reading…",
@@ -313,6 +1017,26 @@ clicking through a website or an app)
   Coordinates are the screenshot's pixels. Look, act, then take another screenshot to check it worked.
   Prefer keyboard shortcuts to clicking (Discord: ctrl+k, type the person's name, Return to open the chat,
   type the message, then send-key Return). Always use send-key, never key, for the final send.
+
+Email (Gmail, read-only; never marks anything as read)
+  guy --mail [--count N] [--all]   today's unread mail in each of the user's accounts (--all: older too): \
+sender, subject, date and a link
+  guy --code   finds the newest verification code in their mail, copies it and types it into the browser; \
+use it when they ask for a code (you never see the code itself)
+  It only sees senders and subjects, not the message text. To show one, xdg-open its link. You can't send, \
+delete or archive mail from here; if they ask, say so and offer to open Gmail.
+
+Calendar (Google Calendar; adding is fine without asking, it's what they asked for)
+  guy --calendar [--days N]   what's coming up in each linked account, with each event's id
+  guy --cal-add "TITLE" "YYYY-MM-DD HH:MM" [--end "YYYY-MM-DD HH:MM" | --for 1h30m] [--where PLACE] \
+[--notes TEXT] [--repeat daily|weekdays|weekly|monthly|yearly] [--account ADDRESS]
+  guy --cal-add "TITLE" YYYY-MM-DD [--end YYYY-MM-DD] --all-day   a whole day (or days, --end inclusive)
+  guy --cal-delete ID [--account ADDRESS]   remove one (to undo a mistake, or when they ask)
+  Work out the exact date and time from what they said and today's date ("next Friday" etc.), and pass \
+"YYYY-MM-DD HH:MM", 24-hour. No length given: an hour (leave out --end). Without --account it goes to the \
+first linked account; pick another only when they name it. Say back what was added: the title, day and \
+time. If no calendar is linked, tell them to run `guy --add-calendar` (setup is in GUY's README). Their \
+reminders (guy --remind) are separate: use those only when they ask GUY to remind them.
 
 Memory
 {memory_path} is your long-term memory about the user. When they tell you something worth keeping (who they are, \
@@ -422,8 +1146,8 @@ list.results > row:hover:not(:selected) { background-color: rgba(255, 255, 255, 
 .footer { font-size: 10.5px; color: rgba(255, 255, 255, 0.42); padding: 7px 18px 11px 18px; }
 """
 
-HINT_IDLE = "Type to search apps, windows and math  ·  Tab ask GUY  ·  Alt+F files  ·  Ctrl+Enter web"
-HINT_RESULTS = "↑↓ select  ·  Enter open  ·  Tab ask GUY  ·  Alt+F files  ·  Ctrl+Enter web"
+HINT_IDLE = "Type to search apps, files, windows and math  ·  Tab ask GUY  ·  Alt+F files  ·  Ctrl+Enter web"
+HINT_RESULTS = "↑↓ select  ·  Enter open  ·  Shift+Enter show in folder  ·  Tab ask GUY  ·  Alt+F files"
 HINT_ANSWER = "Type a follow-up and press Enter  ·  Ctrl+Shift+C copy answer  ·  Esc back to search"
 HINT_FILE = "Enter or Tab ask GUY about the file  ·  Esc close"
 
@@ -657,6 +1381,221 @@ def score(query, name, extra="", words=None, extra_words=None):
 def spawn(*cmd):
     subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
+
+
+UWSM_APP = ["uwsm-app"] if shutil.which("uwsm-app") else ["uwsm", "app"]
+
+
+def launch(*cmd):
+    """Start an app (a desktop entry id, or a command) with arguments, in its own scope so it outlives GUY.
+    uwsm-app hands it to uwsm's app daemon: ~50ms, where `uwsm app` starts Python each time (~200ms)."""
+    spawn(*UWSM_APP, "--", *cmd)
+
+
+def open_path(path):
+    """Open a file or folder in its default app, looked up here rather than through xdg-open's shell script."""
+    if os.path.isdir(path):
+        ctype = "inode/directory"
+    else:
+        ctype = Gio.content_type_guess(path, None)[0]
+    app = Gio.AppInfo.get_default_for_type(ctype, False)
+    if isinstance(app, DesktopAppInfo) and app.get_id():
+        launch(app.get_id(), path)
+    else:
+        launch("xdg-open", path)
+    FILES.opened(path)
+
+
+def show_in_folder(path):
+    """The file manager, at the folder holding `path`, with it selected."""
+    try:
+        Gio.bus_get_sync(Gio.BusType.SESSION).call(
+            "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1",
+            "ShowItems", GLib.Variant("(ass)", ([Gio.File.new_for_path(path).get_uri()], "")),
+            None, Gio.DBusCallFlags.NONE, 3000, None, None, None)
+    except GLib.Error:
+        open_path(os.path.dirname(path))
+
+
+class FileIndex:
+    """Every file and folder's path in one string, and their lowercased names in another, so a search is
+    a few regex scans in C. Built with fd in a thread; new files in the usual folders join it at once."""
+
+    def __init__(self):
+        self.data = None           # (paths, their starts, names (file_key, each once), their starts,
+        #                            entries in name order, where each name's entries start in that order)
+        self.extra = []            # [(path, is_dir)] that appeared since the last build
+        self.built = 0.0
+        self.building = False
+        self.monitors = []
+        try:
+            with open(FILES_OPENED) as f:
+                self.opened_at = json.load(f)    # path -> [times opened, last time]
+        except (OSError, ValueError):
+            self.opened_at = {}
+
+    def stale(self):
+        return time.time() - self.built > FILES_STALE
+
+    def build(self):
+        if self.building:
+            return False
+        self.building = True
+        if not self.monitors:
+            self.watch()
+        threading.Thread(target=self._build, daemon=True).start()
+        return False
+
+    def _build(self):
+        import array
+        import struct
+        started = time.time()
+        try:
+            out = subprocess.run(["nice", "-n", "10", sys.executable, __file__, "--index-files"],
+                                 capture_output=True, timeout=120).stdout
+            sizes, at, parts = struct.unpack_from("6Q", out), 48, []
+        except (OSError, subprocess.SubprocessError, struct.error):
+            self.building = False
+            return
+        for n in sizes:
+            parts.append(out[at:at + n])
+            at += n
+        del out
+        if len(parts[0]) > 1:
+            for k in (1, 3, 4, 5):
+                parts[k] = array.array("I", parts[k])
+            self.data = tuple(parts)
+            self.extra = [x for x in self.extra if x[2] > started]
+            self.built = started
+        self.building = False
+
+    def watch(self):
+        """New files in the folders you use most join the index right away, rather than at the next build."""
+        for sub in FILES_WATCH:
+            d = HOME / sub
+            if not d.is_dir():
+                continue
+            try:
+                mon = Gio.File.new_for_path(str(d)).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+            except GLib.Error:
+                continue
+            mon.connect("changed", self.changed)
+            self.monitors.append(mon)
+
+    def changed(self, _mon, file, other, event):
+        E = Gio.FileMonitorEvent
+        f = other if event in (E.RENAMED, E.MOVED_IN) and other else file
+        if event in (E.CREATED, E.RENAMED, E.MOVED_IN) and f and f.get_path():
+            path = f.get_path()
+            if os.path.basename(path).startswith((".", "~")) or path.endswith((".part", ".crdownload", ".tmp")):
+                return
+            self.extra = [x for x in self.extra if x[0] != path] + [(path, os.path.isdir(path), time.time())]
+
+    def opened(self, path):
+        n, _last = self.opened_at.get(path, (0, 0))
+        self.opened_at[path] = [n + 1, time.time()]
+        if len(self.opened_at) > 500:            # keep the 400 most recent
+            self.opened_at = dict(sorted(self.opened_at.items(), key=lambda kv: -kv[1][1])[:400])
+        try:
+            os.makedirs(os.path.dirname(FILES_OPENED), exist_ok=True)
+            with open(FILES_OPENED, "w") as f:
+                json.dump(self.opened_at, f)
+        except OSError:
+            pass
+
+    def search(self, query, limit=MAX_FILES):
+        """[(score, path, is_dir)], best first. Each word of the query has to be in the path, and at least
+        one in the name itself; a name that starts with it, then a word in it that does, rank highest."""
+        terms = query.lower().split()
+        if not terms or self.data is None and not self.extra:
+            return []
+        found = {}                               # entry -> (path, is_dir)
+        if self.data is not None:
+            paths, starts, names, nstarts, order, runs = self.data
+            for t in {t for t in terms if len(t) > 1 or len(terms) == 1}:
+                tk = file_key(t.encode(errors="surrogateescape"))
+                # tiers: the name starts with it, a word in it does, it's anywhere. Literal finds only (a
+                # regex that starts with a lookbehind tries every position); a longer word is rare enough to
+                # find everywhere in one pass and sort by what's before it, a short one only where it starts
+                tiers = ([], [], [])
+                needles = [tk] if len(tk) > 2 else [b"\0" + tk, b"\1" + tk]
+                for needle in needles:
+                    skip = len(needle) - len(tk)         # where the word itself starts, past a \0 or \1
+                    pos = names.find(needle)
+                    while pos != -1:
+                        before = names[pos - 1] if not skip else needle[0]
+                        tiers[0 if before == 0 else 1 if before == 1 else 2].append(pos + skip)
+                        pos = names.find(needle, pos + len(needle))
+                cap = FILES_CAP if len(tk) > 2 else FILES_CAP // 6
+                got = 0
+                for tier in tiers:
+                    if len(tier) > cap:                  # too many to look at: the shortest names first
+                        tier.sort(key=lambda pos: names.find(b"\0", pos) - names.rfind(b"\0", 0, pos))
+                    for pos in tier:
+                        u = bisect.bisect_right(nstarts, pos) - 1
+                        for i in order[runs[u]:runs[u + 1]]:
+                            if i not in found:
+                                path = paths[starts[i]:starts[i + 1] - 1 if i + 1 < len(starts) else -1]
+                                found[i] = (path.rstrip(b"/").decode(errors="surrogateescape"), path.endswith(b"/"))
+                                got += 1
+                        if got >= cap:
+                            break
+                    if got >= cap:
+                        break
+        seen = {v[0] for v in found.values()}
+        for path, is_dir, _at in self.extra:
+            if path not in seen:
+                found[path] = (path, is_dir)
+        home = str(HOME) + "/"
+        words = [re.compile(r"[ _.\-(\[]" + re.escape(t)) for t in terms]
+        now = time.time()
+        out = []
+        for path, is_dir in found.values():
+            name = path[path.rfind("/") + 1:].lower()
+            stem = name.rsplit(".", 1)[0] if "." in name[1:] else name
+            low = None
+            total, in_name = 0, False
+            for t, word in zip(terms, words):
+                if name == t or stem == t:
+                    total += 100
+                elif name.startswith(t):
+                    total += 80
+                elif t in name:
+                    total += 60 if word.search(name) else 40
+                else:
+                    low = low or path.lower()
+                    if "/" + t in low:
+                        total += 20
+                    elif t in low:
+                        total += 10
+                    else:
+                        break
+                    continue
+                in_name = True
+            else:
+                if not in_name:
+                    continue
+                rel = path[len(home):] if path.startswith(home) else path
+                total -= 4 * rel.count("/") + len(name) / 10 + (8 if "/." in "/" + rel else 0)
+                if hit := self.opened_at.get(path):
+                    total += min(40, 12 * hit[0]) + (20 if now - hit[1] < 86400 * 3 else 0)
+                out.append((total, path, is_dir))
+        best = []
+        for x in sorted(out, key=lambda x: (-x[0], x[1])):
+            if os.path.lexists(x[1]):            # what was deleted since the last build drops out here
+                best.append(x)
+                if len(best) >= limit:
+                    break
+        return best
+
+
+FILES = FileIndex()
+
+
+def file_icon(path, is_dir):
+    if is_dir:
+        return "folder"
+    return Gio.content_type_get_icon(Gio.content_type_guess(path, None)[0])
 
 
 # ---------- things you can just say: volume, music, timers ----------
@@ -922,6 +1861,13 @@ MOODS = {  # the light behind him: (unused), glow colour
 }
 
 
+RAINCOAT, WELLIES, UMBRELLA = (1.0, 0.80, 0.10), (1.0, 0.76, 0.08), (0.86, 0.14, 0.18)
+TSHIRT, SHORTS = (0.98, 0.42, 0.32), (0.22, 0.40, 0.82)
+PUFFER, SCARF = (0.16, 0.24, 0.50), (0.86, 0.14, 0.18)
+SWEATER, TWEED = (0.74, 0.34, 0.13), (0.45, 0.34, 0.24)
+JACKET, STRAW = (0.52, 0.80, 0.62), (0.93, 0.80, 0.50)
+
+
 class Face(Gtk.DrawingArea):
     """Drawn in cairo every frame while it's on screen; costs nothing once the island hides it."""
 
@@ -992,7 +1938,8 @@ class Face(Gtk.DrawingArea):
         # at rest he only breathes and glances around slowly: 30 fps is plenty and halves the cost;
         # a poke, the pointer, a blink or a mood change gets every frame
         calm = (abs(self.squish) < 0.002 and abs(self.squish_v) < 0.02 and px is None
-                and time.monotonic() < self.blink_at - 0.05 and self.drawn_mood == self.mood)
+                and time.monotonic() < self.blink_at - 0.05 and self.drawn_mood == self.mood
+                and self.owner.wardrobe.beats() is None)
         if not calm or t - self.drawn_at >= 1 / 31:
             self.drawn_at, self.drawn_mood = t, self.mood
             self.queue_draw()
@@ -1018,6 +1965,16 @@ class Face(Gtk.DrawingArea):
         sq = self.squish
         (r1, g1, b1), (r2, g2, b2) = self.colors
         dizzy = now < self.dizzy_until
+        wardrobe = self.owner.wardrobe
+        outfit, phones = wardrobe.outfit, wardrobe.music
+        # dancing: he rocks from side to side, dipping on every beat and bouncing up between them
+        beats = wardrobe.beats() if self.mood not in ("waiting", "error") and not dizzy else None
+        sway = dip = hop = 0.0
+        if beats is not None:
+            ph = beats % 1
+            sway = math.cos(math.pi * beats)
+            dip = (1 - ph) ** 4
+            hop = math.sin(math.pi * ph)
 
         # his mood shows as coloured light behind him, like something glowing through glass
         glow = cairo.RadialGradient(cx, Y(0.56), 0, cx, Y(0.56), S * 0.5)
@@ -1040,9 +1997,9 @@ class Face(Gtk.DrawingArea):
 
         cr.save()
         base_y = Y(0.94)
-        cr.translate(cx, base_y)
-        cr.rotate(self.look[0] * 0.06)
-        cr.scale(1 - sq * 0.10 + breath * 0.5, 1 + sq * 0.14 + breath)
+        cr.translate(cx, base_y - hop * S * 0.035)
+        cr.rotate(self.look[0] * 0.06 + sway * 0.12)
+        cr.scale(1 - sq * 0.10 + breath * 0.5 + dip * 0.06, 1 + sq * 0.14 + breath - dip * 0.08)
         cr.translate(-cx, -base_y)
 
         dark_top, dark_bottom = (0.19, 0.20, 0.25), (0.06, 0.06, 0.08)
@@ -1050,21 +2007,41 @@ class Face(Gtk.DrawingArea):
         feathers.add_color_stop_rgb(0, *dark_top)
         feathers.add_color_stop_rgb(1, *dark_bottom)
 
-        # flippers: hanging at his sides, the right one waving when something is done
+        # flippers: hanging at his sides, one waving when something is done (the left in the rain: the right
+        # holds the umbrella), swinging up in turn when he dances, in sleeves when he's wearing something
         wave = self.mood == "done" and not dizzy
+        umbrella = outfit == "rain"
+        waver = -1 if umbrella else 1
+        sleeve = {"rain": RAINCOAT, "cold": PUFFER, "autumn": SWEATER, "spring": JACKET}.get(outfit)
         for side in (-1, 1):
             a = 0.35
-            if side == 1 and wave:
+            if side == 1 and umbrella:
+                a = 0.6
+            elif side == waver and wave:
                 a = 2.3 + math.sin(now * 10) * 0.35
             elif self.mood == "waiting":
                 a = 0.6 + math.sin(now * 6 + side) * 0.08
+            elif beats is not None:
+                a = 0.35 + 1.5 * max(0.0, sway * side) ** 1.5
             cr.save()
             cr.translate(cx + side * S * 0.22, Y(0.46))
             cr.rotate(-side * a)
             ellipse(0, S * 0.15, S * 0.06, S * 0.17)
-            cr.set_source(feathers)
+            if sleeve:
+                cr.set_source_rgb(*sleeve)
+            else:
+                cr.set_source(feathers)
             cr.fill()
+            if outfit in ("sunny", "hot"):  # a short t-shirt sleeve
+                ellipse(0, S * 0.05, S * 0.075, S * 0.075)
+                cr.set_source_rgb(*TSHIRT)
+                cr.fill()
             cr.restore()
+
+        if umbrella:                       # the raincoat's hood, round the back of his head
+            ellipse(cx, Y(0.28), S * 0.215, S * 0.205)
+            cr.set_source_rgb(*RAINCOAT)
+            cr.fill()
 
         # body and head
         cr.new_path()
@@ -1083,10 +2060,16 @@ class Face(Gtk.DrawingArea):
         cr.set_source(belly)
         cr.fill()
 
-        # feet
+        self.draw_clothes(cr, outfit, cx, Y, S, ellipse)
+
+        # feet, in yellow wellies in the rain
         for side in (-1, 1):
+            if umbrella:
+                cr.rectangle(cx + side * S * 0.11 - S * 0.06, Y(0.845), S * 0.12, S * 0.08)
+                cr.set_source_rgb(*WELLIES)
+                cr.fill()
             ellipse(cx + side * S * 0.11, Y(0.925), S * 0.1, S * 0.042)
-            cr.set_source_rgb(0.98, 0.66, 0.14)
+            cr.set_source_rgb(*(WELLIES if umbrella else (0.98, 0.66, 0.14)))
             cr.fill()
 
         # a soft glassy highlight on his head and a thin rim, so he sits in the same light as the island
@@ -1171,7 +2154,221 @@ class Face(Gtk.DrawingArea):
         cr.close_path()
         cr.set_source(beak)
         cr.fill()
+        self.draw_headwear(cr, outfit, phones, cx, Y, S, ellipse)
         cr.restore()
+
+    @staticmethod
+    def draw_clothes(cr, outfit, cx, Y, S, ellipse):
+        """What he wears over his body, cut to its shape below the chin."""
+        if outfit not in OUTFITS[1:]:
+            return
+        cr.save()
+        cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+        ellipse(cx, Y(0.62), S * 0.285, S * 0.32)          # a little bigger than him: clothes sit on top
+        cr.new_sub_path()
+        ellipse(cx, Y(0.29), S * 0.19, S * 0.18)            # minus his head
+        cr.clip()
+        cr.set_fill_rule(cairo.FILL_RULE_WINDING)
+        left, width = cx - S * 0.3, S * 0.6
+        if outfit == "rain":
+            cr.rectangle(left, Y(0.38), width, S * 0.56)
+            coat = cairo.LinearGradient(cx - S * 0.28, 0, cx + S * 0.28, 0)
+            coat.add_color_stop_rgb(0, 1.0, 0.90, 0.35)
+            coat.add_color_stop_rgb(1, *RAINCOAT)
+            cr.set_source(coat)
+            cr.fill()
+            cr.move_to(cx, Y(0.47))
+            cr.line_to(cx, Y(0.93))
+            cr.set_source_rgba(0.55, 0.40, 0.0, 0.6)
+            cr.set_line_width(max(0.6, S * 0.01))
+            cr.stroke()
+            for y in (0.56, 0.68, 0.80):
+                cr.arc(cx + S * 0.03, Y(y), max(0.6, S * 0.014), 0, 2 * math.pi)
+                cr.set_source_rgb(0.35, 0.25, 0.05)
+                cr.fill()
+        elif outfit == "autumn":
+            cr.rectangle(left, Y(0.38), width, S * 0.5)
+            cr.set_source_rgb(*SWEATER)
+            cr.fill()
+            cr.set_source_rgba(1, 0.85, 0.6, 0.25)          # cable knit
+            cr.set_line_width(max(0.6, S * 0.014))
+            for k in (-2, -1, 0, 1, 2):
+                x = cx + k * S * 0.075
+                cr.move_to(x, Y(0.5))
+                for j in range(6):
+                    cr.line_to(x + (S * 0.012 if j % 2 else -S * 0.012), Y(0.52 + j * 0.06))
+            cr.stroke()
+            cr.rectangle(left, Y(0.84), width, S * 0.04)    # ribbed hem
+            cr.set_source_rgba(0, 0, 0, 0.2)
+            cr.fill()
+        elif outfit == "spring":
+            for side in (-1, 1):                            # an open jacket: his belly shows down the middle
+                x0 = cx + side * S * 0.07
+                cr.rectangle(min(x0, x0 + side * S * 0.25), Y(0.38), S * 0.25, S * 0.5)
+            cr.set_source_rgb(*JACKET)
+            cr.fill()
+            cr.set_source_rgba(0.1, 0.35, 0.2, 0.5)
+            cr.set_line_width(max(0.6, S * 0.01))
+            for side in (-1, 1):
+                cr.move_to(cx + side * S * 0.07, Y(0.46))
+                cr.line_to(cx + side * S * 0.07, Y(0.9))
+            cr.stroke()
+        elif outfit in ("sunny", "hot"):
+            cr.rectangle(left, Y(0.38), width, S * 0.34)
+            cr.set_source_rgb(*TSHIRT)
+            cr.fill()
+            cr.rectangle(left, Y(0.72), width, S * 0.14)
+            cr.set_source_rgb(*SHORTS)
+            cr.fill()
+            cr.move_to(cx, Y(0.78))
+            cr.line_to(cx, Y(0.86))
+            cr.set_source_rgba(0.05, 0.12, 0.35, 0.8)
+            cr.set_line_width(max(0.6, S * 0.012))
+            cr.stroke()
+        else:
+            cr.rectangle(left, Y(0.38), width, S * 0.53)
+            cr.set_source_rgb(*PUFFER)
+            cr.fill()
+            cr.set_source_rgba(0, 0, 0.1, 0.45)             # the puffer's quilted baffles
+            cr.set_line_width(max(0.6, S * 0.012))
+            for k in range(6):
+                y = Y(0.52 + k * 0.07)
+                cr.move_to(left, y)
+                cr.curve_to(cx - S * 0.1, y + S * 0.02, cx + S * 0.1, y + S * 0.02, left + width, y)
+            cr.move_to(cx, Y(0.46))
+            cr.line_to(cx, Y(0.92))
+            cr.stroke()
+        cr.restore()
+        if outfit == "autumn":                              # the sweater's turtleneck
+            ellipse(cx, Y(0.455), S * 0.17, S * 0.035)
+            cr.set_source_rgb(*(c * 0.85 for c in SWEATER))
+            cr.fill()
+        if outfit == "spring":                              # a flower on the lapel
+            fx, fy, r = cx - S * 0.15, Y(0.54), S * 0.022
+            for k in range(5):
+                a = k * 2 * math.pi / 5
+                cr.arc(fx + math.cos(a) * r, fy + math.sin(a) * r, r * 0.8, 0, 2 * math.pi)
+                cr.set_source_rgb(1.0, 0.62, 0.78)
+                cr.fill()
+            cr.arc(fx, fy, r * 0.6, 0, 2 * math.pi)
+            cr.set_source_rgb(1.0, 0.85, 0.2)
+            cr.fill()
+        if outfit == "cold":
+            # a striped scarf round his neck, one end hanging down
+            cr.save()
+            cr.translate(cx + S * 0.07, Y(0.47))
+            cr.rotate(-0.12)
+            cr.rectangle(-S * 0.035, 0, S * 0.07, S * 0.15)
+            cr.restore()
+            cr.new_sub_path()
+            ellipse(cx, Y(0.455), S * 0.19, S * 0.04)
+            cr.set_source_rgb(*SCARF)
+            cr.fill()
+            cr.set_source_rgba(1, 1, 1, 0.85)
+            cr.set_line_width(max(0.6, S * 0.012))
+            for k in (-2, -1, 0, 1, 2):
+                cr.move_to(cx + k * S * 0.07, Y(0.425))
+                cr.line_to(cx + k * S * 0.07, Y(0.485))
+            cr.stroke()
+
+    @staticmethod
+    def draw_headwear(cr, outfit, phones, cx, Y, S, ellipse):
+        """Hat, headphones and umbrella, over everything else."""
+        if outfit == "cold":
+            # a bobble hat: ribbed, with a turned-up cuff and a pompom
+            cr.save()
+            cr.translate(cx, Y(0.165))
+            cr.scale(S * 0.19, S * 0.12)
+            cr.arc(0, 0, 1, math.pi, 2 * math.pi)
+            cr.restore()
+            cr.close_path()
+            cr.set_source_rgb(*SCARF)
+            cr.fill()
+            cr.set_source_rgba(0, 0, 0, 0.18)
+            cr.set_line_width(max(0.5, S * 0.008))
+            for k in (-2, -1, 0, 1, 2):
+                cr.move_to(cx + k * S * 0.06, Y(0.165))
+                cr.line_to(cx + k * S * 0.045, Y(0.07))
+            cr.stroke()
+            cr.rectangle(cx - S * 0.2, Y(0.145), S * 0.4, S * 0.045)
+            cr.set_source_rgb(0.96, 0.94, 0.88)
+            cr.fill()
+            cr.arc(cx, Y(0.04), S * 0.04, 0, 2 * math.pi)
+            cr.fill()
+        if outfit == "autumn":
+            # a tweed flat cap, its peak over his eyes
+            cr.save()
+            ellipse(cx, Y(0.29), S * 0.2, S * 0.19)
+            cr.clip()
+            cr.rectangle(cx - S * 0.21, Y(0.09), S * 0.42, S * 0.085)
+            cr.set_source_rgb(*TWEED)
+            cr.fill()
+            cr.restore()
+            ellipse(cx + S * 0.02, Y(0.172), S * 0.16, S * 0.025)
+            cr.set_source_rgb(*(c * 0.8 for c in TWEED))
+            cr.fill()
+        if outfit == "hot":
+            # a straw sun hat with a red band
+            ellipse(cx, Y(0.155), S * 0.3, S * 0.045)
+            cr.set_source_rgb(*STRAW)
+            cr.fill()
+            cr.move_to(cx - S * 0.13, Y(0.155))
+            cr.curve_to(cx - S * 0.13, Y(0.04), cx + S * 0.13, Y(0.04), cx + S * 0.13, Y(0.155))
+            cr.close_path()
+            cr.fill()
+            cr.rectangle(cx - S * 0.13, Y(0.125), S * 0.26, S * 0.03)
+            cr.set_source_rgb(*UMBRELLA)
+            cr.fill()
+        if phones:
+            r = S * (0.235 if outfit in ("cold", "rain") else 0.215)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.new_path()
+            cr.arc(cx, Y(0.30), r, math.pi * 1.08, math.pi * 1.92)
+            cr.set_source_rgb(0.16, 0.16, 0.19)
+            cr.set_line_width(max(1.0, S * 0.035))
+            cr.stroke()
+            for side in (-1, 1):
+                ellipse(cx + side * (r - S * 0.01), Y(0.31), S * 0.05, S * 0.075)
+                cr.set_source_rgb(0.16, 0.16, 0.19)
+                cr.fill()
+                ellipse(cx + side * (r + S * 0.005), Y(0.31), S * 0.025, S * 0.05)
+                cr.set_source_rgb(0.25, 0.75, 0.98)
+                cr.fill()
+        if outfit == "rain":
+            # an umbrella in his right flipper, held over his head
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.move_to(cx + S * 0.37, Y(0.72))
+            cr.line_to(cx + S * 0.08, Y(0.08))
+            cr.set_source_rgb(0.25, 0.25, 0.28)
+            cr.set_line_width(max(0.8, S * 0.018))
+            cr.stroke()
+            cr.new_path()
+            cr.arc(cx + S * 0.37 - S * 0.03, Y(0.72), S * 0.03, 0, math.pi)
+            cr.stroke()
+            ux, uy, rx, ry = cx + S * 0.08, Y(0.125), S * 0.34, S * 0.115
+            cr.save()
+            cr.new_path()
+            cr.translate(ux, uy)
+            cr.scale(rx, ry)
+            cr.arc(0, 0, 1, math.pi, 2 * math.pi)
+            for k in range(4):                              # scalloped edge between the ribs
+                cr.arc_negative(0.75 - k * 0.5, 0, 0.25, 0, math.pi)
+            cr.close_path()
+            cr.restore()
+            path = cr.copy_path()
+            cr.set_source_rgb(*UMBRELLA)
+            cr.fill()
+            cr.save()
+            cr.append_path(path)
+            cr.clip()
+            for k in (-1, 1):                               # white panels
+                cr.move_to(ux, uy - ry * 1.1)
+                cr.line_to(ux + k * rx * 0.25, uy + ry)
+                cr.line_to(ux + k * rx * 0.75, uy + ry)
+                cr.close_path()
+            cr.set_source_rgb(0.96, 0.95, 0.92)
+            cr.fill()
+            cr.restore()
 
 
 # ---------- the island: a liquid-glass shape hanging from the top edge ----------
@@ -1346,79 +2543,259 @@ def bridge_path(cr, x, y, w, h, r, b, closed=True):
         cr.close_path()
 
 
-def draw_glass(cr, path, bbox, fade=None, fast=False, ring=0.0):
+_SCREEN_SCALE = [1.25]            # the screen's scale, kept up to date by the island
+
+
+try:
+    import numpy as np
+except ImportError:                       # optional: without it the glass is drawn the slower way
+    np = None
+
+
+def _gauss(a, sigma):
+    """A Gaussian blur (three box blurs) of a 2-D float array, sigma in pixels."""
+    if sigma < 0.4:
+        return a
+    r = max(1, int(round((math.sqrt(4 * sigma * sigma + 1) - 1) / 2)))
+    n = 2 * r + 1
+    for _ in range(3):
+        c = np.cumsum(np.pad(a, ((0, 0), (r + 1, r))), axis=1, dtype=np.float32)
+        a = (c[:, n:] - c[:, :-n]) / n
+        c = np.cumsum(np.pad(a, ((r + 1, r), (0, 0))), axis=0, dtype=np.float32)
+        a = (c[n:, :] - c[:-n, :]) / n
+    return a
+
+
+def _surface(rect, sc, fmt=cairo.FORMAT_ARGB32):
+    """A surface covering rect (x, y, w, h) at sc pixels per point, its origin on that pixel grid."""
+    x0, y0 = math.floor(rect[0] * sc), math.floor(rect[1] * sc)
+    pw = max(1, math.ceil((rect[0] + rect[2]) * sc) - x0)
+    ph = max(1, math.ceil((rect[1] + rect[3]) * sc) - y0)
+    img = cairo.ImageSurface(fmt, pw, ph)
+    c = cairo.Context(img)
+    c.scale(sc, sc)
+    c.translate(-x0 / sc, -y0 / sc)
+    return img, c, Graphene.Rect().init(x0 / sc, y0 / sc, pw / sc, ph / sc)
+
+
+def _alpha(img):
+    img.flush()
+    return np.frombuffer(img.get_data(), np.uint8).reshape(img.get_height(), img.get_stride())[:, :img.get_width()]
+
+
+def _texture(img, fmt=Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED):
+    img.flush()
+    return Gdk.MemoryTexture.new(img.get_width(), img.get_height(), fmt, GLib.Bytes.new(bytes(img.get_data())),
+                                 img.get_stride())
+
+
+def _alpha_texture(a, white):
+    """An ARGB texture from an alpha array in 0..1: black (a shadow) or white (a glow)."""
+    a8 = (np.clip(a, 0, 1) * 255).astype(np.uint8)
+    h, w = a8.shape
+    px = np.empty((h, w, 4), np.uint8)
+    px[..., 3] = a8
+    px[..., :3] = a8[..., None] if white else 0
+    return Gdk.MemoryTexture.new(w, h, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED, GLib.Bytes.new(px.tobytes()), w * 4)
+
+
+def draw_glass(snap, path, bbox, fade=None, fast=False, ring=0.0):
     """The glass along `path` (a function drawing the outline: path(cr, closed)), inside `bbox`
-    (x, y, w, h). fade: fade the shadow out toward the top edge over that many pixels (glass hanging
-    from the edge); None for glass floating free. fast: fewer, wider bands in the shadow and glow, for
-    frames where it's moving (about 2x quicker, and the difference doesn't show in motion). ring: a
-    brighter rim, for a floating GUY that has the keyboard."""
+    (x, y, w, h), as a few textures the GPU stacks:
+      - the drop shadow: the shape blurred (sigma 23) at 1/6 resolution,
+      - the glass: its fill, its 1px rim, and the crisp strip of shadow just under it, at full resolution,
+      - the inner glow: the rim blurred inward, at 1/2 resolution,
+    with the shadow and glow cut off at the glass by a full-resolution mask, so their edges are exact.
+    Blurring a filled shape is ~1-2 ms where stroking the falloff was 7-10; tuned to match the old look
+    (kitty's glass) to within a fraction of a level of 255. fade: fade the shadow out toward the top edge
+    over that many pixels (glass hanging from the edge); None for glass floating free. ring: a brighter
+    rim, for a floating GUY that has the keyboard. (fast is unused: this is quick at full quality.)"""
+    if np is None:
+        return _draw_glass_strokes(snap, path, bbox, fade, ring)
     g = GLASS
     bx, by, bw, bh = bbox
+    S = _SCREEN_SCALE[0]
+    off = g["shadow_offset"]
 
-    # drop shadow, outside the glass only
-    cr.save()
-    pad = g["shadow_range"] + 4
-    cr.rectangle(bx - pad, by - pad, bw + 2 * pad, bh + 2 * pad + g["shadow_offset"])
-    path(cr, True)
-    cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
-    cr.clip()
-    cr.set_fill_rule(cairo.FILL_RULE_WINDING)
-    cr.push_group()
-    cr.translate(0, g["shadow_offset"])
-    cr.set_line_join(cairo.LINE_JOIN_ROUND)
-    steps = 5 if fast else 13
+    # the glass's shape at full resolution: cuts the shadow off exactly at the glass (one GPU mask; the
+    # graphics card here is quick at textures and slow at blurs and stacked masks rebuilt every frame)
+    grect = (bx - 2, by - 2, bw + 4, bh + 4 + off)
+    img, c, shape_rect = _surface(grect, S, cairo.FORMAT_A8)
+    path(c, True)
+    c.fill()
+    del c
+    shape = _texture(img, Gdk.MemoryFormat.A8)
+
+    # the soft shadow: the shape blurred (sigma 23) at 1/6 resolution
+    pad = g["shadow_range"] + 6
+    low = S / 6
+    img, c, low_rect = _surface((bx - pad, by - pad, bw + 2 * pad, bh + 2 * pad + off), low, cairo.FORMAT_A8)
+    c.translate(0, off)
+    path(c, True)
+    c.fill()
+    del c
+    a = 0.58 * _gauss(_alpha(img).astype(np.float32) / 255, 23 * low)
+    if fade:
+        # hanging from the top edge: faded out toward the bar so it doesn't smudge it
+        ys = low_rect.get_y() + (np.arange(a.shape[0]) + 0.5) / low
+        a *= np.clip(ys / max(fade, 24), 0, 1)[:, None]
+    snap.push_mask(Gsk.MaskMode.INVERTED_ALPHA)
+    snap.append_texture(shape, shape_rect)
+    snap.pop()
+    snap.append_texture(_alpha_texture(a, False), low_rect)
+    snap.pop()
+
+    # the glass, as one full-resolution texture: the crisp strip of shadow just under it, its fill (the
+    # terminal's background colour at the terminal's opacity, blurred by Hyprland), the inner glow, the rim
+    img, c, rect = _surface(grect, S)
+    c.save()
+    c.translate(0, off)
+    path(c, True)
+    c.restore()
+    if fade:
+        grad = cairo.LinearGradient(0, 0, 0, max(fade, 24))
+        grad.add_color_stop_rgba(0, 0, 0, 0, 0)
+        grad.add_color_stop_rgba(1, 0, 0, 0, 0.26)
+        c.set_source(grad)
+    else:
+        c.set_source_rgba(0, 0, 0, 0.26)
+    c.fill()
+    c.set_operator(cairo.OPERATOR_DEST_OUT)
+    path(c, True)
+    c.set_source_rgba(0, 0, 0, 1)
+    c.fill()
+    c.set_operator(cairo.OPERATOR_OVER)
+    path(c, True)
+    c.set_source_rgba(*g["fill"])
+    c.fill_preserve()
+    c.clip()
+    c.set_line_join(cairo.LINE_JOIN_BEVEL)
+    for half_width, alpha in GLOW_BANDS:         # white at the rim, fading inward
+        path(c, False)
+        c.set_source_rgba(1, 1, 1, alpha)
+        c.set_line_width(2 * half_width)
+        c.stroke()
+    c.reset_clip()
+    path(c, False)
+    c.set_source_rgba(1, 1, 1, g["rim_alpha"] + 0.36 * ring)
+    c.set_line_width(1.0 + ring)
+    c.stroke()
+    del c
+    snap.append_texture(_texture(img), rect)
+
+
+GLOW_BANDS = ((7.0, 0.042), (4.0, 0.035), (1.5, 0.025))   # (reach inward, alpha): tuned to the old glow
+def outline(c, path):
+    """The outline, closed and open, built once on this context and kept: drawing the glass strokes it
+    ~30 times, and rebuilding the squircle corners in Python each time was a third of the cost."""
+    c.new_path()
+    path(c, True)
+    closed = c.copy_path()
+    c.new_path()
+    path(c, False)
+    open_ = c.copy_path()
+    c.new_path()
+    return closed, open_
+
+
+def glass_layer(snap, rect, div, draw):
+    """Draw onto a texture covering rect (x, y, w, h) at 1/div of the screen's resolution and append it.
+    Its origin sits on the screen's pixel grid, so a full-resolution layer is never resampled (its 1px rim
+    stays crisp); a reduced one is scaled up smoothly by the GPU."""
+    sc = _SCREEN_SCALE[0] / div
+    x0, y0 = math.floor(rect[0] * sc), math.floor(rect[1] * sc)
+    x1, y1 = math.ceil((rect[0] + rect[2]) * sc), math.ceil((rect[1] + rect[3]) * sc)
+    pw, ph = max(1, x1 - x0), max(1, y1 - y0)
+    img = cairo.ImageSurface(cairo.FORMAT_ARGB32, pw, ph)
+    c = cairo.Context(img)
+    c.scale(sc, sc)
+    c.translate(-x0 / sc, -y0 / sc)
+    draw(c)
+    del c
+    img.flush()
+    texture = Gdk.MemoryTexture.new(pw, ph, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+                                    GLib.Bytes.new(bytes(img.get_data())), img.get_stride())
+    snap.append_texture(texture, Graphene.Rect().init(x0 / sc, y0 / sc, pw / sc, ph / sc))
+
+
+def _draw_glass_strokes(snap, path, bbox, fade=None, ring=0.0):
+    """The glass drawn with strokes (the fallback without numpy): as three textures the GPU stacks: the drop shadow at 1/3 resolution, the glass and its
+    1px rim at full resolution, and the inner glow at 1/2. The shadow and glow are soft falloffs made of
+    wide strokes, the slow part to draw (5-10 ms at full size); at reduced size they're under a
+    millisecond and look the same. fade: fade the shadow out toward the top edge over that many pixels
+    (glass hanging from the edge); None for glass floating free. ring: a brighter rim, for a floating GUY
+    that has the keyboard."""
+    g = GLASS
+    bx, by, bw, bh = bbox
 
     def shade(d):
         return g["shadow_alpha"] * max(0.0, 1 - d / g["shadow_range"]) ** g["shadow_power"]
 
-    path(cr, True)
-    cr.set_source_rgba(0, 0, 0, shade(0))
-    cr.fill()
-    step = g["shadow_range"] / steps
-    for k in range(1, steps + 1):
-        d = step * k
-        path(cr, True)
-        cr.set_source_rgba(0, 0, 0, shade(d - step) - shade(d))
-        cr.set_line_width(2 * d)
-        cr.stroke()
-    cr.pop_group_to_source()
-    if fade:
-        # hanging from the top edge: faded out toward the bar so it doesn't smudge it
-        grad = cairo.LinearGradient(0, 0, 0, max(fade, 24))
-        grad.add_color_stop_rgba(0, 0, 0, 0, 0)
-        grad.add_color_stop_rgba(1, 0, 0, 0, 1)
-        cr.mask(grad)
-    else:
-        cr.paint()
-    cr.restore()
+    def shadow(c):
+        closed, _open = outline(c, path)
+        c.save()
+        c.translate(0, g["shadow_offset"])
+        # bevel joins: on an outline this smooth they look the same as round ones, and round ones were
+        # most of the cost of these wide strokes
+        c.set_line_join(cairo.LINE_JOIN_BEVEL)
+        c.append_path(closed)
+        c.set_source_rgba(0, 0, 0, shade(0))
+        c.fill()
+        steps = 13
+        step = g["shadow_range"] / steps
+        for k in range(1, steps + 1):
+            d = step * k
+            c.append_path(closed)
+            c.set_source_rgba(0, 0, 0, shade(d - step) - shade(d))
+            c.set_line_width(2 * d)
+            c.stroke()
+        c.restore()
+        # outside the glass only
+        c.set_operator(cairo.OPERATOR_DEST_OUT)
+        c.append_path(closed)
+        c.set_source_rgba(0, 0, 0, 1)
+        c.fill()
+        if fade:
+            # hanging from the top edge: faded out toward the bar so it doesn't smudge it
+            c.set_operator(cairo.OPERATOR_DEST_IN)
+            grad = cairo.LinearGradient(0, 0, 0, max(fade, 24))
+            grad.add_color_stop_rgba(0, 0, 0, 0, 0)
+            grad.add_color_stop_rgba(1, 0, 0, 0, 1)
+            c.set_source(grad)
+            c.paint()
 
-    # the glass itself: the terminal's background colour at the terminal's opacity, blurred by Hyprland
-    path(cr, True)
-    cr.set_source_rgba(*g["fill"])
-    cr.fill()
+    pad = g["shadow_range"] + 4
+    glass_layer(snap, (bx - pad, by - pad, bw + 2 * pad, bh + 2 * pad + g["shadow_offset"]), 3, shadow)
 
-    # inner glow: white at the rim fading to nothing, the same falloff as the terminal's lit edge
-    cr.save()
-    path(cr, True)
-    cr.clip()
+    def glass(c):
+        # the terminal's background colour at the terminal's opacity, blurred by Hyprland; and the 1px rim
+        closed, open_ = outline(c, path)
+        c.append_path(closed)
+        c.set_source_rgba(*g["fill"])
+        c.fill()
+        c.append_path(open_)
+        c.set_source_rgba(1, 1, 1, g["rim_alpha"] + 0.36 * ring)
+        c.set_line_width(1.0 + ring)
+        c.stroke()
+
+    glass_layer(snap, (bx - 2, by - 2, bw + 4, bh + 4), 1, glass)
 
     def glow(d):
         return g["glow_alpha"] * max(0.0, 1 - d / g["glow_range"]) ** g["glow_power"]
 
-    cr.set_line_join(cairo.LINE_JOIN_ROUND)
-    band = 3 if fast else 1
-    for k in range(int(g["glow_range"]), 0, -band):
-        path(cr, False)
-        cr.set_source_rgba(1, 1, 1, glow(max(0, k - band)) - glow(k))
-        cr.set_line_width(2 * k)
-        cr.stroke()
-    cr.restore()
+    def glows(c):
+        # white at the rim fading to nothing, the same falloff as the terminal's lit edge
+        closed, open_ = outline(c, path)
+        c.append_path(closed)
+        c.clip()
+        c.set_line_join(cairo.LINE_JOIN_BEVEL)
+        for k in range(int(g["glow_range"]), 0, -1):
+            c.append_path(open_)
+            c.set_source_rgba(1, 1, 1, glow(k - 1) - glow(k))
+            c.set_line_width(2 * k)
+            c.stroke()
 
-    # the 1px rim, even all the way round
-    path(cr, False)
-    cr.set_source_rgba(1, 1, 1, g["rim_alpha"] + 0.36 * ring)
-    cr.set_line_width(1.0 + ring)
-    cr.stroke()
+    glass_layer(snap, (bx - 1, by - 1, bw + 2, bh + 2), 2, glows)
 
 
 ORB = 64                          # a floating GUY, pulled out of the island
@@ -1456,7 +2833,7 @@ class Island(Gtk.Widget):
         self.follow = False      # the target height tracks the content's natural height
         self.on_target = None    # called when following changes the target
         # the glass as last drawn, one render node per piece: GTK re-snapshots the island whenever anything
-        # inside it redraws (the penguin, 30-60 times a second), and drawing a panel's glass takes 10-18 ms,
+        # inside it redraws (the penguin, 30-60 times a second), and drawing a panel's glass takes a few ms,
         # so each piece is drawn at the origin, cached by its shape, and only moved (or, for small changes
         # of size like a wobble or a stretch, scaled) from frame to frame
         self.nodes = {}
@@ -1518,30 +2895,13 @@ class Island(Gtk.Widget):
         self.content.allocate(tw, ch, -1, Gsk.Transform.new().translate(Graphene.Point().init(x, y)))
 
     def cached(self, role, key, bounds, draw):
-        """The render node for one piece of glass: drawn by draw(cr) within bounds, or reused. It's a
-        texture, not a cairo node: GTK uploads a cairo node to the GPU again on every frame (several MB
-        for a panel, the difference between a smooth drag and 30 fps), a texture once."""
+        """The render node for one piece of glass, drawn by draw(snapshot), or reused while its shape
+        (key) is the same. (bounds is unused: GPU drawing knows its own.)"""
         old = self.nodes.get(role)
         if old and old[0] == key:
             return old[1]
-        scale = self.scale()
-        # on the screen's pixel grid (the screen is at a fractional scale): a texture between pixels is
-        # resampled differently on every frame it moves, and its 1px rim shimmers
-        x0, y0 = math.floor(bounds[0] * scale), math.floor(bounds[1] * scale)
-        x1, y1 = math.ceil((bounds[0] + bounds[2]) * scale), math.ceil((bounds[1] + bounds[3]) * scale)
-        bx, by = x0 / scale, y0 / scale
-        pw, ph = max(1, x1 - x0), max(1, y1 - y0)
-        img = cairo.ImageSurface(cairo.FORMAT_ARGB32, pw, ph)
-        img.set_device_scale(scale, scale)
-        cr = cairo.Context(img)
-        cr.translate(-bx, -by)
-        draw(cr)
-        del cr
-        img.flush()
-        texture = Gdk.MemoryTexture.new(pw, ph, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
-                                        GLib.Bytes.new(bytes(img.get_data())), img.get_stride())
         glass = Gtk.Snapshot()
-        glass.append_texture(texture, Graphene.Rect().init(bx, by, pw / scale, ph / scale))
+        draw(glass)
         node = glass.to_node()
         self.nodes[role] = (key, node)
         return node
@@ -1549,7 +2909,10 @@ class Island(Gtk.Widget):
     def scale(self):
         native = self.get_native()
         surface = native.get_surface() if native else None
-        return surface.get_scale() if surface is not None else 1.0
+        sc = surface.get_scale() if surface is not None else 1.0
+        if surface is not None:
+            _SCREEN_SCALE[0] = sc
+        return sc
 
     def snap(self, v):
         """v, on a whole screen pixel."""
@@ -1957,49 +3320,362 @@ class PacmanWatcher:
 
 class MediaWatcher:
     """Whatever is playing (Spotify, a browser tab, mpv…), from MPRIS via `playerctl --follow`, which
-    blocks until something changes, so it costs nothing while nothing does."""
+    blocks until something changes, so it costs nothing while nothing does. Every player is followed
+    (a paused browser tab mustn't hide Spotify playing), and he wears headphones while any of them plays."""
 
     FORMAT = "{{playerName}}\t{{status}}\t{{artist}}\t{{title}}"
+    KEYS = ("player", "status", "artist", "title")
 
     def __init__(self, guy):
         self.guy = guy
-        self.now = None            # {"player", "status", "artist", "title"}
+        self.now = None            # what the pill shows: {"player", "status", "artist", "title"}
+        self.players = {}          # player name -> the same, for every player with something loaded
         self.announce = 0.0        # until then, show the next track change even when paused (after "next")
         if not shutil.which("playerctl"):
             return
         try:
-            self.proc = subprocess.Popen(["playerctl", "--follow", "metadata", "--format", self.FORMAT],
+            self.proc = subprocess.Popen(["playerctl", "-a", "--follow", "metadata", "--format", self.FORMAT],
                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                                          start_new_session=True)
         except OSError:
             return
         threading.Thread(target=self.read, daemon=True).start()
+        # a safety net: now and then --follow misses a player starting, stopping or closing, which would
+        # leave his headphones on (or off) until the next change
+        GLib.timeout_add_seconds(15, self.resync)
 
     def read(self):
         for line in self.proc.stdout:
             GLib.idle_add(self.changed, line.rstrip("\n"))
 
+    def resync(self):
+        """Every player's state, asked afresh."""
+        def work():
+            try:
+                out = subprocess.run(["playerctl", "-a", "metadata", "--format", self.FORMAT],
+                                     capture_output=True, text=True, timeout=3).stdout
+            except (OSError, subprocess.SubprocessError):
+                return
+            players = {}
+            for line in out.splitlines():
+                f = line.split("\t")
+                if len(f) >= 4 and f[0] and f[3]:
+                    players[f[0]] = dict(zip(self.KEYS, f[:4]))
+            GLib.idle_add(self.synced, players)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def synced(self, players):
+        self.players = players
+        self.show(None)
+        return False
+
     def changed(self, line):
         fields = line.split("\t")
-        if len(fields) < 4 or not fields[3]:
-            self.now = None
-            self.guy.remove_activity("media")
+        if len(fields) < 4 or not fields[0]:
+            self.resync()          # a player closed, and playerctl doesn't say which
             return False
+        p = dict(zip(self.KEYS, fields[:4]))
+        if p["title"]:
+            self.players[p["player"]] = p
+        else:
+            self.players.pop(p["player"], None)
+            p = None
+        self.show(p)
+        return False
+
+    def show(self, p):
+        """Headphones while anything plays; the pill shows what's playing, or else what changed last."""
+        playing = [x for x in self.players.values() if x["status"] == "Playing"]
+        self.guy.wardrobe.set_music(bool(playing))
         before = self.now
-        self.now = dict(zip(("player", "status", "artist", "title"), fields[:4]))
-        playing = self.now["status"] == "Playing"
-        act = self.guy.set_activity("media", "media", self.now["title"],
-                                    "media-playback-start-symbolic" if playing else "media-playback-pause-symbolic",
-                                    detail=self.now["artist"] or self.now["player"])
+        if p and (p["status"] == "Playing" or not playing):
+            now = p
+        elif before and self.players.get(before["player"], {}).get("status") == "Playing":
+            now = self.players[before["player"]]
+        elif playing:
+            now = playing[0]
+        else:
+            now = self.players.get(before["player"]) if before else None
+        self.now = now
+        if now is None:
+            if before is not None:
+                self.guy.remove_activity("media")
+                self.guy.apply()
+            return
+        if before == now:
+            return
+        is_playing = now["status"] == "Playing"
+        act = self.guy.set_activity("media", "media", now["title"],
+                                    "media-playback-start-symbolic" if is_playing else "media-playback-pause-symbolic",
+                                    detail=now["artist"] or now["player"])
         act.state = "idle"         # shown in the list and popped on changes, never keeps the pill out
-        new_track = before is None or before["title"] != self.now["title"]
+        new_track = before is None or before["title"] != now["title"]
         asked = new_track and time.monotonic() < self.announce
-        if asked or (playing and (new_track or before["status"] != "Playing")):
+        if asked or (p is now and is_playing and (new_track or before["status"] != "Playing")):
             self.announce = 0.0
             self.guy.pop(act, 4.0)
         else:
             self.guy.apply()
+
+
+# ---------- what he wears: dressed for the weather outside, headphones on (and dancing) while music plays ----------
+LOOK_FILE = SOCK.parent / "guy-look.json"     # orbit reads this, so the Tux in its cube matches him
+OUTFITS = ("plain", "rain", "cold", "autumn", "spring", "sunny", "hot")
+WEATHER_EVERY = 1800
+# wttr.in's weather codes
+RAIN_CODES = {176, 185, 200, 263, 266, 281, 284, 293, 296, 299, 302, 305, 308, 311, 314, 353, 356, 359, 386, 389}
+SNOW_CODES = {179, 182, 227, 230, 317, 320, 323, 326, 329, 332, 335, 338, 350, 362, 365, 368, 371, 374, 377, 392,
+              395}
+
+
+# how much rain, snow or fog each code means (0-1), and whether it thunders
+RAIN_AMOUNT = {176: 0.25, 263: 0.2, 266: 0.2, 185: 0.3, 281: 0.3, 284: 0.4, 293: 0.35, 296: 0.35, 311: 0.3,
+               314: 0.6, 353: 0.4, 299: 0.6, 302: 0.65, 356: 0.7, 305: 1.0, 308: 1.0, 359: 1.0, 200: 0.3,
+               386: 0.5, 389: 1.0, 182: 0.3, 317: 0.3, 320: 0.3, 362: 0.3, 365: 0.4}
+SNOW_AMOUNT = {179: 0.25, 182: 0.3, 227: 0.5, 230: 1.0, 317: 0.4, 320: 0.5, 323: 0.35, 326: 0.35, 329: 0.6,
+               332: 0.6, 335: 1.0, 338: 1.0, 350: 0.4, 362: 0.4, 365: 0.5, 368: 0.35, 371: 0.8, 374: 0.4,
+               377: 0.5, 392: 0.4, 395: 0.9}
+FOG_AMOUNT = {143: 0.4, 248: 0.8, 260: 0.8}
+THUNDER_CODES = {200, 386, 389, 392, 395}
+MOON_PHASES = {"New Moon": 0.0, "Waxing Crescent": 0.125, "First Quarter": 0.25, "Waxing Gibbous": 0.375,
+               "Full Moon": 0.5, "Waning Gibbous": 0.625, "Last Quarter": 0.75, "Waning Crescent": 0.875}
+
+
+def sky_for(data):
+    """What the sky over you looks like, for orbit to draw: amounts 0-1, sun and moon times in minutes after
+    midnight (local time, where you are), and the moon's phase (0 new, 0.5 full)."""
+    now, astro = data["current_condition"][0], data["weather"][0]["astronomy"][0]
+
+    def minutes(text):
+        try:
+            t = time.strptime(text.strip(), "%I:%M %p")
+            return t.tm_hour * 60 + t.tm_min
+        except ValueError:
+            return None                  # "No moonrise" and the like
+
+    code, precip = int(now["weatherCode"]), float(now.get("precipMM") or 0)
+    rain, snow = RAIN_AMOUNT.get(code, 0.0), SNOW_AMOUNT.get(code, 0.0)
+    if rain:
+        rain = max(rain, min(1.0, precip / 6))
+    if snow:
+        snow = max(snow, min(1.0, precip / 4))
+    fog = max(FOG_AMOUNT.get(code, 0.0), max(0.0, min(1.0, (5 - float(now.get("visibility") or 10)) / 5)))
+    return {"cloud": float(now.get("cloudcover") or 0) / 100, "rain": rain, "snow": snow, "fog": fog,
+            "thunder": code in THUNDER_CODES, "wind": float(now.get("windspeedKmph") or 0),
+            "wind_dir": float(now.get("winddirDegree") or 0),
+            "sunrise": minutes(astro["sunrise"]), "sunset": minutes(astro["sunset"]),
+            "moonrise": minutes(astro["moonrise"]), "moonset": minutes(astro["moonset"]),
+            "moon_phase": MOON_PHASES.get(astro.get("moon_phase", "").strip(), 0.5),
+            "moon_illum": float(astro.get("moon_illumination") or 0) / 100,
+            "temp": float(now.get("temp_C") or 10), "lat": float(data["nearest_area"][0].get("latitude") or 45),
+            "lon": float(data["nearest_area"][0].get("longitude") or 0)}
+
+
+def outfit_for(code, feels_c, month):
+    """Rain: raincoat, wellies and umbrella. Snow or 5°C and below: puffer, scarf and bobble hat. 25°C and up:
+    t-shirt, shorts and a sun hat; 18°C and up: t-shirt and shorts. In between it's a mild day, dressed for the
+    season: a sweater and cap in autumn, a light jacket in spring (and outside those, by how mild)."""
+    if code in SNOW_CODES:
+        return "cold"
+    if code in RAIN_CODES:
+        return "rain"
+    if feels_c <= 5:
+        return "cold"
+    if feels_c >= 25:
+        return "hot"
+    if feels_c >= 18:
+        return "sunny"
+    if month in (9, 10, 11):
+        return "autumn"
+    if month in (3, 4, 5):
+        return "spring"
+    return "autumn" if feels_c <= 12 else "spring"
+
+
+class Wardrobe:
+    """The weather where you are, from wttr.in (which finds you by your IP, as the bar's weather does), and
+    whether music is playing; what he wears follows from them."""
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.weather = "plain"
+        self.summary = None
+        self.sky = None                # for orbit's sky: see sky_for
+        self.forced = None             # `guy --outfit`
+        self.music = False
+        self.beat = BeatTracker(self)
+        self.refresh()
+        GLib.timeout_add_seconds(WEATHER_EVERY, self.refresh)
+
+    @property
+    def outfit(self):
+        return self.forced or self.weather
+
+    def beats(self):
+        """Beats since the tracker's reference beat (a float: the fraction is where in the beat we are),
+        or None when he isn't dancing."""
+        b = self.beat
+        if not self.music or not b.bpm:
+            return None
+        return (time.time() - b.t0) * b.bpm / 60
+
+    def refresh(self):
+        def work():
+            import urllib.request
+            try:
+                req = urllib.request.Request("https://wttr.in/?format=j1", headers={"User-Agent": "curl/8"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = json.load(r)
+                now = data["current_condition"][0]
+                outfit = outfit_for(int(now["weatherCode"]), float(now["FeelsLikeC"]), time.localtime().tm_mon)
+                summary = f'{now["weatherDesc"][0]["value"].strip()}, {now["temp_C"]}°C'
+                sky = sky_for(data)
+            except Exception:  # noqa: BLE001 - offline: he keeps on what he's wearing
+                return
+            GLib.idle_add(self.got, outfit, summary, sky)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def got(self, outfit, summary, sky):
+        self.weather, self.summary, self.sky = outfit, summary, sky
+        self.publish()
         return False
+
+    def force(self, outfit):
+        self.forced = outfit if outfit in OUTFITS else None
+        self.publish()
+
+    def set_music(self, playing):
+        if playing == self.music:
+            return
+        self.music = playing
+        self.beat.start() if playing else self.beat.stop()
+        self.publish()
+
+    def publish(self):
+        b = self.beat
+        look = {"outfit": self.outfit, "headphones": self.music, "weather": self.summary, "sky": self.sky,
+                "bpm": round(b.bpm, 2) if self.music and b.bpm else None, "beat": b.t0}
+        try:
+            tmp = LOOK_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(look))
+            tmp.replace(LOOK_FILE)
+        except OSError:
+            pass
+        for f in self.guy.faces:
+            f.queue_draw()
+        return False
+
+
+class BeatTracker:
+    """Finds the beat of whatever is playing so he can dance in time. It listens to what goes to your speakers
+    (`parec` on the output's monitor), only while music plays, and only keeps a few seconds of how loud each
+    moment was, never the sound itself."""
+
+    RATE, HOP = 11025, 256
+
+    def __init__(self, wardrobe):
+        self.wardrobe = wardrobe
+        self.proc = None
+        self.bpm = None                # None until it hears a steady beat
+        self.t0 = 0.0                  # time.time() of a beat
+
+    def start(self):
+        if self.proc or not shutil.which("parec"):
+            return
+        try:
+            sink = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True,
+                                  timeout=2).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            sink = ""
+        try:
+            self.proc = subprocess.Popen(
+                ["parec", "-d", f"{sink}.monitor" if sink else "@DEFAULT_MONITOR@", "--format=s16le",
+                 f"--rate={self.RATE}", "--channels=1", "--raw", "--latency-msec=40"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            self.proc = None
+            return
+        threading.Thread(target=self.listen, args=(self.proc,), daemon=True).start()
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
+            self.proc = None
+        self.bpm = None
+
+    def listen(self, proc):
+        import numpy as np
+        fps = self.RATE / self.HOP
+        keep = int(fps * 8)                       # tempo from the last 8 seconds
+        onsets = np.zeros(keep)
+        window = np.hanning(2 * self.HOP)
+        weight = np.ones(self.HOP + 1)
+        # kick drums carry the beat; hi-hats (between the beats) touch every band, so they'd win a plain count:
+        # below ~200 Hz weighs as much as everything else together, and above ~4 kHz is left out
+        weight[1:10] = 20.0
+        weight[190:] = 0.0
+        prev_samples = np.zeros(self.HOP, np.float32)
+        prev_mag = np.zeros(self.HOP + 1)
+        frames = 0
+        while True:
+            data = proc.stdout.read(self.HOP * 2 * 4)
+            if len(data) < self.HOP * 2 * 4:
+                break
+            arrived = time.time()
+            x = np.frombuffer(data, "<i2").astype(np.float32) / 32768
+            for hop in x.reshape(4, self.HOP):
+                mag = np.log1p(100 * np.abs(np.fft.rfft(np.concatenate([prev_samples, hop]) * window)))
+                onsets = np.roll(onsets, -1)
+                onsets[-1] = np.sum(np.maximum(mag - prev_mag, 0) * weight)   # spectral flux
+                prev_samples, prev_mag = hop, mag
+                frames += 1
+            if frames >= fps * 4 and frames % int(fps) < 4:
+                self.analyse(np, onsets[-min(frames, keep):], fps, arrived)
+        if self.proc is proc:
+            self.proc = None
+            self.bpm = None
+
+    def analyse(self, np, o, fps, end_time):
+        """Tempo from the onsets' autocorrelation (leaning towards 120 BPM, where most music sits), then the
+        beat's phase from where onsets line up best on that grid."""
+        o = o - np.convolve(o, np.ones(11) / 11, "same")
+        o = np.maximum(o, 0)
+        energy = np.dot(o, o) / len(o)
+        if energy < 1e-6:                         # silence: paused audio, or a quiet stretch
+            self.bpm = None
+            GLib.idle_add(self.wardrobe.publish)
+            return
+        lags = np.arange(int(fps * 60 / 180), int(fps * 60 / 70) + 2)
+        ac = np.array([np.dot(o[k:], o[:-k]) / (len(o) - k) for k in lags])
+        bpms = fps * 60 / lags
+        score = ac * np.exp(-0.5 * (np.log2(bpms / 120) / 0.7) ** 2)
+        i = int(np.argmax(score))
+        if ac[i] / energy < 0.12:                 # no clear beat
+            self.bpm = None
+            GLib.idle_add(self.wardrobe.publish)
+            return
+        lag = float(lags[i])
+        if 0 < i < len(ac) - 1:                   # refine between whole frames
+            a, b, c = ac[i - 1], ac[i], ac[i + 1]
+            lag += 0.5 * (a - c) / (a - 2 * b + c) if a - 2 * b + c else 0
+        bpm = fps * 60 / lag
+        offsets = np.arange(int(lag))
+        idx = len(o) - 1 - offsets[:, None] - np.round(np.arange(int(len(o) / lag) - 1) * lag).astype(int)[None, :]
+        phase = offsets[int(np.argmax(o[np.clip(idx, 0, len(o) - 1)].sum(1)))]
+        t0 = end_time - phase / fps - 0.03       # the onset frame centres sit a little before they arrive
+        if self.bpm and abs(bpm / self.bpm - 1) < 0.04:
+            # the same tempo: settle on it smoothly instead of jumping
+            period = 60 / self.bpm
+            err = ((t0 - self.t0) / period + 0.5) % 1 - 0.5
+            self.bpm = self.bpm * 0.8 + bpm * 0.2
+            self.t0 += err * period * 0.35
+        else:
+            self.bpm, self.t0 = bpm, t0
+        GLib.idle_add(self.wardrobe.publish)
 
 
 PKG_TOOLS = ("yay", "paru", "pacman", "pamac", "makepkg")
@@ -2149,6 +3825,428 @@ class NewsWatcher:
             self.fetched = time.time()
             self.guy.apply()
         return False
+
+
+# ---------- unread Gmail, for the overview (accounts: guy --add-mail) ----------
+MAIL_EVERY = 300                  # seconds between checks
+IDLE_EVERY = 120                  # seconds each IDLE round waits before checking the connection
+# the whole query, so "email mom I'm late" still goes to GUY rather than opening some email
+MAIL_WORDS = re.compile(r"(?:any |new |my |check |show |unread |(?:what'?s |anything )?in )*(?:e-?mails?|g?mail|inbox)\??", re.I)
+CODE_WORDS = re.compile(r"(?:what'?s |get |find |copy |paste |fill in |type )?(?:me )?(?:my |the |a )?(?:latest |last |new )?"
+                        r"(?:verification |security |login |sign[- ]?in |2fa |one[- ]time |email )?(?:code|otp|passcode)\??", re.I)
+CAL_WORDS = re.compile(r"\b(?:to|in|on|from|my) (?:google )?calendar\b|\bcalendar\b.*\b(?:add|put|book|schedule)\b", re.I)
+BROWSERS = re.compile(r"firefox|librewolf|zen|floorp|waterfox|chrom|brave|vivaldi|edge|opera|epiphany|qutebrowser|"
+                      r"falkon|helium", re.I)
+
+
+class MailWatcher:
+    """Unread mail in each account of ~/.config/guy/mail.json, checked every 5 minutes in the background
+    and when the overview opens on a stale check. Mail that arrived since the last check pops the pill
+    out with a chime. {"search": "..."} in the file changes which mail counts (any Gmail search).
+
+    Each account also keeps one connection waiting in IMAP IDLE, so Gmail says the moment anything lands
+    in the inbox (any tab, not just Primary), and the new mail is announced straight from that connection.
+    It's read here, never sent anywhere, for a verification code, which GUY copies and types into the
+    browser (Guy.use_code). {"codes": false} switches that off, {"autofill": false} just the typing."""
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.boxes = []            # [{"address", "label", "unread", "items", "error"}], in the file's order
+        self.seen = {}             # address -> uids already shown; missing until its first check
+        self.fetched = 0.0
+        self.busy = False
+        self.again = False         # a refresh was asked for while one was running
+        self.code = None           # the newest code found: {"code", "sender", "address", "at"}
+        self.push_gen = 0          # bumped to retire the IDLE threads when the accounts change
+        self.cursor = {}           # address -> (UIDVALIDITY, the next UID to look at), kept across reconnects
+        GLib.timeout_add_seconds(20, lambda: self.refresh() and False)
+        GLib.timeout_add_seconds(MAIL_EVERY, self.refresh)
+        GLib.timeout_add_seconds(8, self.start_push)
+        try:                       # back from sleep: the IDLE connections are dead, so start fresh ones
+            Gio.bus_get_sync(Gio.BusType.SYSTEM).signal_subscribe(
+                "org.freedesktop.login1", "org.freedesktop.login1.Manager", "PrepareForSleep",
+                "/org/freedesktop/login1", None, Gio.DBusSignalFlags.NONE,
+                lambda *a: a[5].unpack()[0] or GLib.timeout_add_seconds(3, self.start_push))
+        except GLib.Error:
+            pass
+
+    def stale(self):
+        return time.time() - self.fetched > MAIL_EVERY
+
+    def refresh(self):
+        if self.busy:
+            self.again = True
+            return True
+        accounts, cfg = mail_accounts()
+        if not accounts:
+            if self.boxes:
+                self.boxes = []
+                self.guy.apply()
+            return True
+        self.busy = True
+        search, count = cfg.get("search", MAIL_SEARCH), int(cfg.get("count", MAIL_COUNT))
+
+        labels = mail_labels(accounts)
+
+        def work():
+            boxes = []
+            for a in accounts:
+                box = {"address": a["address"], "label": labels[a["address"]], "unread": 0, "items": [], "error": None}
+                try:
+                    password = mail_password(a["address"])
+                    if password:
+                        box["unread"], box["items"] = fetch_mail(a["address"], password, search, count)
+                    else:
+                        box["error"] = "no password in the keyring: run guy --add-mail " + a["address"]
+                except Exception as e:  # noqa: BLE001 - one account failing doesn't stop the others
+                    box["error"] = mail_error(e)
+                boxes.append(box)
+            GLib.idle_add(self.got, boxes)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def got(self, boxes):
+        self.busy = False
+        old = {b["address"]: b for b in self.boxes}
+        fresh = []
+        for b in boxes:
+            if b["error"]:                     # offline, say: keep what was there, with the reason
+                if b["address"] in old:
+                    b["unread"], b["items"] = old[b["address"]]["unread"], old[b["address"]]["items"]
+                continue
+            uids = {m["uid"] for m in b["items"]}
+            if b["address"] in self.seen:
+                fresh += [(b, m) for m in b["items"] if m["uid"] not in self.seen[b["address"]]]
+            self.seen[b["address"]] = self.seen.get(b["address"], set()) | uids
+        self.boxes = boxes
+        self.fetched = time.time()
+        if fresh:
+            self.announce(fresh)
+        else:
+            self.guy.apply()
+        if self.again:
+            self.again = False
+            self.refresh()
+        return False
+
+    def announce(self, fresh):
+        """Chime, and show the newest of [(box, message)] at the top."""
+        b, m = max(fresh, key=lambda x: x[1]["when"])
+        more = f"  ·  +{len(fresh) - 1} more" if len(fresh) > 1 else ""
+        where = f"{b['label']}  ·  " if len(self.boxes) > 1 else ""
+        self.guy.chime()
+        if time.time() - (self.code or {}).get("at", 0) > 15:   # the code's notice stays up
+            self.guy.flash(f"✉ {where}{m['sender']}: {m['subject']}{more}", "done", 6)
+        else:
+            self.guy.apply()
+
+    def arrived(self, address, items):
+        """New mail matching the search, seen by an IDLE connection: shown now, without waiting for a check."""
+        seen = self.seen.get(address)          # missing before the first check, which then counts these as seen
+        items = [m for m in items if seen is None or m["uid"] not in seen]
+        if not items:
+            return False
+        if seen is not None:
+            seen.update(m["uid"] for m in items)
+        box = next((b for b in self.boxes if b["address"] == address), None)
+        if box is None:
+            box = {"address": address, "label": mail_labels(mail_accounts()[0]).get(address, address),
+                   "unread": 0, "items": [], "error": None}
+            self.boxes.append(box)
+        box["items"] = sorted(items + box["items"], key=lambda x: -x["when"])
+        box["unread"] += len(items)
+        self.announce([(box, m) for m in items])
+        return False
+
+    # ----- push: new mail the moment it arrives -----
+    def start_push(self):
+        self.push_gen += 1
+        for a in mail_accounts()[0]:
+            threading.Thread(target=self.push, args=(a["address"], self.push_gen), daemon=True).start()
+        return False
+
+    def push(self, address, gen):
+        import imaplib
+        wait = 5
+        while gen == self.push_gen:
+            try:
+                password = mail_password(address)
+                if not password:
+                    return
+                with imaplib.IMAP4_SSL(MAIL_HOST, timeout=30) as m:
+                    m.login(address, password)
+                    m.select("INBOX", readonly=True)
+                    _t, data = m.response("UIDVALIDITY")
+                    validity = data[0] if data else None
+                    _t, data = m.response("UIDNEXT")
+                    top = int(data[0]) if data and data[0] else 0
+                    known, nxt = self.cursor.get(address, (None, 0))
+                    if known != validity or not nxt:
+                        nxt = top                # first time: from now on
+                    elif top > nxt:
+                        nxt = self.check_new(m, address, nxt)    # what came while it was away
+                    self.cursor[address] = (validity, nxt)
+                    wait = 5
+                    while gen == self.push_gen:
+                        _t, data = m.response("EXISTS")     # mail that came while it was busy with the last
+                        news = bool(data and data[0])
+                        # short rounds: each ends with a round trip, so a connection that died quietly
+                        # (a new network, say) is noticed within IDLE_EVERY rather than Gmail's 10 minutes
+                        if not news:
+                            with m.idle(duration=IDLE_EVERY) as idler:
+                                for typ, _data in idler:
+                                    if typ == "EXISTS":
+                                        news = True
+                                        break
+                        if news and gen == self.push_gen:
+                            nxt = self.check_new(m, address, nxt)
+                            self.cursor[address] = (validity, nxt)
+            except Exception:  # noqa: BLE001 - offline, asleep, password changed: wait, then try again
+                pass
+            if gen != self.push_gen:
+                return
+            time.sleep(wait)
+            wait = min(wait * 2, 300)
+
+    def check_new(self, m, address, nxt):
+        """Announce the mail with UIDs from `nxt` on, and look in it for a code; returns the next UID to look from."""
+        _t, data = m.uid("SEARCH", None, f"UID {max(nxt, 1)}:*")
+        uids = [int(u) for u in (data[0].split() if data and data[0] else []) if int(u) >= nxt]
+        if not uids:
+            return nxt
+        cfg = mail_accounts()[1]
+        if cfg.get("codes", True) is not False:
+            self.find_codes(m, address, uids)
+        self.match_new(m, address, uids, cfg.get("search", MAIL_SEARCH))
+        GLib.idle_add(lambda: self.refresh() and False)     # the exact counts, in the background
+        return max(uids) + 1
+
+    def match_new(self, m, address, uids, search):
+        """Which of these new UIDs the search takes in, announced as they're found. Gmail's search can lag
+        a few seconds behind the inbox, so the rest are asked about again before giving up on them."""
+        left = set(uids)
+        for delay in (0, 2, 4, 8):
+            time.sleep(delay)
+            spec = ",".join(map(str, sorted(left)))
+            _t, data = m.uid("SEARCH", None, "UID", spec, "X-GM-RAW", mail_query(search, False))
+            hits = {int(u) for u in (data[0].split() if data and data[0] else [])} & left
+            if hits:
+                GLib.idle_add(self.arrived, address, mail_headers(m, address, sorted(hits)))
+                left -= hits
+            if not left:
+                return
+
+    def find_codes(self, m, address, uids):
+        import email
+        import email.policy
+        import email.utils
+        import imaplib
+        _t, data = m.uid("FETCH", ",".join(map(str, uids)), "(INTERNALDATE RFC822.SIZE)")
+        fresh = []
+        for p in data:
+            meta = p if isinstance(p, bytes) else p[0] if p else b""
+            uid, size = re.search(rb"UID (\d+)", meta), re.search(rb"RFC822\.SIZE (\d+)", meta)
+            got = imaplib.Internaldate2tuple(meta)
+            if uid and not ((size and int(size.group(1)) > 2_000_000) or (got and time.time() - time.mktime(got) > 600)):
+                fresh.append(uid.group(1).decode())      # not attachment-sized, and not an old one moved in
+        for uid in reversed(fresh):                      # the newest first
+            _t, data = m.uid("FETCH", uid, "(BODY.PEEK[])")
+            part = next((p for p in data if isinstance(p, tuple)), None)
+            if not part:
+                continue
+            msg = email.message_from_bytes(part[1], policy=email.policy.default)
+            code = find_code(str(msg["Subject"] or ""), message_text(msg))
+            if code:
+                name, addr = email.utils.parseaddr(str(msg["From"] or ""))
+                GLib.idle_add(self.found, {"code": code, "sender": name or addr, "address": address,
+                                           "at": time.time()})
+                return
+
+    def found(self, c):
+        if not (self.code and self.code["code"] == c["code"] and c["at"] - self.code["at"] < 120):
+            self.code = c
+            self.guy.use_code(c, fill=mail_accounts()[1].get("autofill", True) is not False)
+        return False
+
+    def lookup_code(self):
+        """guy --code / Ask GUY: the newest code from the last 15 minutes, from memory or from each inbox."""
+        if self.code and time.time() - self.code["at"] < 900:
+            self.guy.use_code(self.code)
+            return
+        self.guy.flash("Looking for a verification code…", "working", 20)
+
+        def work():
+            for a in mail_accounts()[0]:
+                try:
+                    hit = recent_code(a["address"], mail_password(a["address"]) or "")
+                except Exception:  # noqa: BLE001 - try the next account
+                    continue
+                if hit:
+                    self.code = {"code": hit[0], "sender": hit[1], "address": a["address"], "at": hit[2]}
+                    GLib.idle_add(lambda: self.guy.use_code(self.code) and False)
+                    return
+            GLib.idle_add(lambda: self.guy.flash("No verification code in your mail from the last 15 minutes",
+                                                 "error", 5) and False)
+
+        threading.Thread(target=work, daemon=True).start()
+
+
+# ---------- texts from an iPhone, over Bluetooth ----------
+PHONE_CONFIG = Path.home() / ".config/guy/phone.json"
+PHONE_RETRY = 60                  # seconds between tries to reach the phone, at first
+PHONE_RETRY_MAX = 600             # backing off to this while it stays away (each try pages the radio)
+PHONE_KEEP = 30                   # messages kept for the overview
+MAS_UUID = "00001132-0000-1000-8000-00805f9b34fb"     # Bluetooth Message Access, on the phone
+
+
+def parse_bmessage(b):
+    """(text, sender's name, sender's number) from a MAP bMessage."""
+    text = "\n".join(re.findall(r"BEGIN:MSG\r?\n(.*?)\r?\nEND:MSG", b, re.S)).strip()
+    card = b.split("BEGIN:BENV")[0]                 # the originator's vCard comes before the envelope
+    name = re.search(r"^FN[^:]*:(.*)$", card, re.M)
+    if not (name and name.group(1).strip()):
+        name = re.search(r"^N[^:]*:(.*)$", card, re.M)
+    tel = re.search(r"^TEL[^:]*:(.*)$", card, re.M)
+    name = " ".join(x for x in reversed((name.group(1) if name else "").strip().split(";")[:2]) if x).strip() \
+        if name and ";" in name.group(1) else (name.group(1).strip() if name else "")
+    return text, name, tel.group(1).strip() if tel else ""
+
+
+class PhoneWatcher:
+    """New texts and iMessages from a paired iPhone, over Bluetooth Message Access: the way a car reads
+    your messages out. Needs the phone paired with this computer and "Show Notifications" switched on for it
+    (iPhone: Settings > Bluetooth > ⓘ). GUY reaches for it while it's away (every minute, backing off to every
+    10), downloads each new
+    message on this computer (never sends it anywhere), pops it up at the top, and copies and types in
+    verification codes the same way as from mail. ~/.config/guy/phone.json: {"address": "AA:BB:..."} picks
+    the phone when several are paired, {"phone": false} switches it off."""
+
+    def __init__(self, guy):
+        self.guy = guy
+        self.name = None           # the phone's name while connected
+        self.session = None        # obexd's MAP session
+        self.connecting = False
+        self.next_try = 0.0        # monotonic time of the next try while the phone is away
+        self.wait = PHONE_RETRY
+        self.messages = []         # [{"when", "sender", "text"}], newest first
+        self.tmp = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "guy-phone"
+        try:
+            self.system = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        except GLib.Error:
+            return
+        self.bus.signal_subscribe("org.bluez.obex", "org.freedesktop.DBus.ObjectManager", None, None, None,
+                                  Gio.DBusSignalFlags.NONE, self.on_obex)
+        GLib.timeout_add_seconds(6, lambda: self.connect() and False)
+        GLib.timeout_add_seconds(PHONE_RETRY, self.connect)
+
+    @staticmethod
+    def config():
+        try:
+            return json.loads(PHONE_CONFIG.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def find_phone(self):
+        """(address, name) of a paired phone offering Message Access, or None."""
+        cfg = self.config()
+        try:
+            objs = self.system.call_sync("org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
+                                         None, None, Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+        except GLib.Error:
+            return None
+        for ifaces in objs.values():
+            d = ifaces.get("org.bluez.Device1")
+            if d and d.get("Paired") and MAS_UUID in (d.get("UUIDs") or []) \
+                    and cfg.get("address", d.get("Address")).upper() == d.get("Address", "").upper():
+                return d["Address"], d.get("Alias") or d.get("Name") or "iPhone"
+        return None
+
+    def connect(self):
+        if self.session or self.connecting or self.config().get("phone", True) is False \
+                or time.monotonic() < self.next_try:
+            return True
+        phone = self.find_phone()
+        if not phone:
+            return True
+        self.connecting = True
+
+        def done(bus, res):
+            self.connecting = False
+            try:
+                self.session = bus.call_finish(res).unpack()[0]
+                self.name = phone[1]
+                self.wait = PHONE_RETRY
+                self.guy.apply()
+            except GLib.Error:                   # out of range, or asleep: try again later, less often
+                self.next_try = time.monotonic() + self.wait
+                self.wait = min(self.wait * 2, PHONE_RETRY_MAX)
+
+        self.bus.call("org.bluez.obex", "/org/bluez/obex", "org.bluez.obex.Client1", "CreateSession",
+                      GLib.Variant("(sa{sv})", (phone[0], {"Target": GLib.Variant("s", "map")})), None,
+                      Gio.DBusCallFlags.NONE, 60000, None, done)
+        return True
+
+    def on_obex(self, _c, _sender, _path, _iface, signal, params):
+        if signal == "InterfacesRemoved":
+            path, _ifaces = params.unpack()
+            if path == self.session:             # the phone went away
+                self.session = self.name = None
+                self.next_try, self.wait = 0.0, PHONE_RETRY
+                self.guy.apply()
+            return
+        if signal != "InterfacesAdded":
+            return
+        path, ifaces = params.unpack()
+        m = ifaces.get("org.bluez.obex.Message1")
+        if m is None or not str(m.get("Folder", "")).endswith("inbox") or not path.startswith(str(self.session)):
+            return
+        self.fetch(path, m)
+
+    def fetch(self, path, m):
+        """Download the message into a private folder in /run, read it, and delete it."""
+        self.tmp.mkdir(mode=0o700, exist_ok=True)
+        target = self.tmp / path.rsplit("/", 1)[-1]
+
+        def got(bus, res):
+            try:
+                transfer = bus.call_finish(res).unpack()[0]
+            except GLib.Error:
+                return
+            GLib.timeout_add(250, self.read, transfer, target, m, time.monotonic())
+
+        self.bus.call("org.bluez.obex", path, "org.bluez.obex.Message1", "Get",
+                      GLib.Variant("(sb)", (str(target), False)), None, Gio.DBusCallFlags.NONE, 30000, None, got)
+
+    def read(self, transfer, target, m, started):
+        try:
+            status = self.bus.call_sync("org.bluez.obex", transfer, "org.freedesktop.DBus.Properties", "Get",
+                                        GLib.Variant("(ss)", ("org.bluez.obex.Transfer1", "Status")), None,
+                                        Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+        except GLib.Error:
+            status = "complete"                  # the transfer is gone once it's finished
+        if status in ("queued", "active") and time.monotonic() - started < 30:
+            return True
+        try:
+            text, name, number = parse_bmessage(target.read_text(encoding="utf-8", errors="replace"))
+            target.unlink()
+        except OSError:
+            text, name, number = str(m.get("Subject") or ""), "", ""
+        sender = name or m.get("SenderName") or number or m.get("Sender") or "Someone"
+        self.got(sender, text)
+        return False
+
+    def got(self, sender, text):
+        self.messages = ([{"when": time.time(), "sender": sender, "text": text}] + self.messages)[:PHONE_KEEP]
+        code = find_code("", text)
+        if code:
+            c = {"code": code, "sender": sender, "address": None, "to": "iPhone", "at": time.time()}
+            self.guy.mail.code = c               # so guy --code and Ask GUY "code" find it too
+            self.guy.use_code(c, fill=mail_accounts()[1].get("autofill", True) is not False)
+        else:
+            self.guy.chime()
+            self.guy.flash(f"💬 {sender}: {' '.join(text.split()) or 'sent you a message'}", "done", 8)
 
 
 # ---------- stock prices (Yahoo Finance, no key needed) ----------
@@ -2500,7 +4598,6 @@ class Guy:
         self.items, self.view, self.mode_list = [], "idle", "search"
         self.claude_proc, self.claude_gen, self.answer_text = None, 0, ""
         self.render_id, self.chat_stick = None, True
-        self.file_gen = 0
         self.history, self.attachment, self.last_query = [], None, ""
 
         provider = Gtk.CssProvider()
@@ -2579,9 +4676,15 @@ class Guy:
         self.downloads = DownloadWatcher(self)
         self.pacman = PacmanWatcher(self)
         self.prompts = PromptWatcher(self)
+        self.wardrobe = Wardrobe(self)
         self.media = MediaWatcher(self)
         self.news = NewsWatcher(self)
         self.stocks = Stocks(self)
+        self.mail = MailWatcher(self)
+        GLib.timeout_add_seconds(5, FILES.build)     # the file index, so the first search has it
+        if UWSM_APP == ["uwsm-app"]:              # its daemon takes a second to start: not on the first open
+            spawn("systemctl", "--user", "start", "--no-block", "wayland-wm-app-daemon.service")
+        self.phone = PhoneWatcher(self)
         self.stock_timer = None
         self.app_monitor = Gio.AppInfoMonitor.get()   # kept: the monitor only lives while referenced
         self.app_monitor.connect("changed", _apps_changed)
@@ -2957,7 +5060,9 @@ class Guy:
         playing = self.media.now and self.media.now["status"] == "Playing"
         news = self.news.items
         watch = [self.stocks.quotes[s] for s in self.stocks.watchlist() if s in self.stocks.quotes]
-        shown = (self.prompt, self.home_expanded, updates, playing, tuple(news),
+        mail = self.mail.boxes
+        texts = (self.phone.name, tuple((m["when"], m["sender"], m["text"]) for m in self.phone.messages))
+        shown = (self.prompt, self.home_expanded, updates, playing, tuple(news), mail, texts,
                  tuple((q["symbol"], q["price"], q["change"]) for q in watch),
                  [(s.id, s.status, s.last, bool(s.reply), age(s.updated)) for s in sessions],
                  [(a.key, a.state, a.title, a.detail, a.progress, bool(a.open), bool(getattr(a, "reply", None)),
@@ -2973,7 +5078,7 @@ class Guy:
                                                 else "input-keyboard-symbolic")
             icon.add_css_class("aicon")
             self.add_row(icon, self.prompt["text"], "Click to go to the terminal", None, self.focus_prompt)
-        if not (sessions or acts or updates or self.prompt or schedule or news or watch):
+        if not (sessions or acts or updates or self.prompt or schedule or news or watch or mail or self.phone.messages):
             empty = Gtk.Label(xalign=0, wrap=True, max_width_chars=60,
                               label="Nothing running. Drop a file on me, or press Alt+Space and ask me anything.")
             empty.add_css_class("empty")
@@ -3028,6 +5133,38 @@ class Guy:
             self.add_row(icon, item.get("text", ""), when + every, None, None, None,
                          self.small_button("Cancel", buttons[-1][1]), key=f"sched:{item.get('id')}",
                          more=more, buttons=buttons[:-1])
+        if self.phone.messages or self.phone.name:
+            icon = Gtk.Image.new_from_icon_name("phone-symbolic")
+            icon.add_css_class("aicon")
+            last = self.phone.messages[0] if self.phone.messages else None
+            summary = f"{last['sender']}: {' '.join(last['text'].split())}" if last else "No new messages"
+            more = [("", f"{self.phone.name} connected" if self.phone.name else "iPhone not in range")]
+            more += [(f"{m['sender']}  ·  {age(m['when'])}", m["text"] or "(no text)") for m in self.phone.messages]
+            self.add_row(icon, "iPhone", summary, age(last["when"]) if last else None, key="phone", more=more,
+                         buttons=[("Clear", self.clear_texts)] if last else (), scroll=260)
+        if mail:
+            unread = sum(b["unread"] for b in mail)
+            icon = Gtk.Image.new_from_icon_name("mail-unread-symbolic" if unread else "mail-read-symbolic")
+            icon.add_css_class("aicon")
+            newest = max((m for b in mail for m in b["items"]), key=lambda m: m["when"], default=None)
+            if len(mail) > 1:
+                summary = "   ".join(f"{b['label']} {'!' if b['error'] else b['unread']}" for b in mail)
+            elif mail[0]["error"]:
+                summary = mail[0]["error"]
+            else:
+                summary = f"{newest['sender']}: {newest['subject']}" if newest else "Nothing new today"
+            more = []
+            for b in mail:
+                more.append((b["label"], f"{b['address']}  ·  " + (b["error"] or f"{b['unread']} unread today"),
+                             lambda u=mail_link(b["address"]): self.open_link(u)))
+                more += [(f"{m['sender']}  ·  {age(m['when']) if m['when'] else ''}", m["subject"],
+                          lambda u=m["link"]: self.open_link(u)) for m in b["items"]]
+            buttons = [("Refresh", self.mail.refresh)]
+            if newest:
+                buttons.insert(0, ("Brief me", self.mail_brief))
+            self.add_row(icon, f"{unread} unread today" if unread else "Mail", summary,
+                         age(newest["when"]) if newest and newest["when"] else None, key="mail", more=more,
+                         buttons=buttons, scroll=260)
         if watch:
             icon = Gtk.Image.new_from_icon_name("utilities-system-monitor-symbolic")
             icon.add_css_class("aicon")
@@ -3067,6 +5204,38 @@ class Guy:
                         "important first. Look things up if a headline needs context.\n\n" + lines,
                         shown="Brief me on the news")
 
+    def clear_texts(self):
+        self.phone.messages = []
+        self.apply()
+
+    def use_code(self, c, fill=True):
+        """A verification code: onto the clipboard, typed into the focused browser (when it's not your mail
+        itself, and never followed by Enter), and shown at the top: which code, from whom, to which account."""
+        spawn("wl-copy", "--", c["code"])
+        typed = False
+        if fill and self.user_mode != "ask":
+            try:
+                win = json.loads(subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True,
+                                                text=True, timeout=2).stdout or "{}")
+            except (OSError, subprocess.SubprocessError, ValueError):
+                win = {}
+            if BROWSERS.search(win.get("class", "")) and not re.search(r"gmail|inbox|mail", win.get("title", ""), re.I):
+                spawn("wtype", "--", c["code"])
+                typed = True
+        to = c.get("to") or mail_labels(mail_accounts()[0]).get(c["address"], c["address"])
+        self.chime()
+        self.flash(f"🔑 {c['code']}  {'typed in and copied' if typed else 'copied'}  ·  {c['sender']} → {to}", "done", 12)
+        return False
+
+    def mail_brief(self):
+        """GUY sorts the unread mail (sender and subject only, never the bodies) into what matters, in Ask GUY."""
+        lines = "\n".join(f"- [{b['label']}] {m['sender']}: {m['subject']}" for b in self.mail.boxes for m in b["items"])
+        self.user_mode = None
+        self.open_ask()
+        self.ask_claude("Here's my unread email (sender and subject only). In a few lines: what looks like it "
+                        "needs me, and what can wait. Don't open or look up the emails.\n\n" + lines,
+                        shown="Brief me on my mail")
+
     def small_button(self, label, fn):
         b = Gtk.Button(label=label)
         b.add_css_class("action")
@@ -3105,9 +5274,10 @@ class Guy:
             self.ap_more.set_label(f"{more} more waiting" if more else "")
 
     def add_row(self, lead, title, detail, when, click=None, progress=None, trailing=None,
-                key=None, more=None, buttons=()):
+                key=None, more=None, buttons=(), scroll=None):
         """One row of the overview. A row with something to open opens it; any other row with a key
-        expands in place to show everything about it (the full text, `more`, and its `buttons`)."""
+        expands in place to show everything about it (the full text, `more`, and its `buttons`).
+        With `scroll`, the `more` lines scroll past that many pixels tall (the buttons stay put)."""
         expanded = key is not None and self.home_expanded == key
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         outer.add_css_class("session")
@@ -3143,6 +5313,12 @@ class Guy:
         if expanded:
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
             box.add_css_class("more")
+            lines = box
+            if scroll:
+                lines = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+                scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                              max_content_height=scroll, child=lines)
+                box.append(scroller)
             for label, value, *link in more or ():
                 if not value:
                     continue
@@ -3154,14 +5330,14 @@ class Guy:
                                  + GLib.markup_escape_text(str(value)))
                     b.set_child(t)
                     b.connect("clicked", lambda _b, fn=link[0]: fn())
-                    box.append(b)
+                    lines.append(b)
                     continue
                 v = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, selectable=True,
                               max_width_chars=80)
                 v.set_markup((f"<b>{GLib.markup_escape_text(label)}</b>  " if label else "")
                              + GLib.markup_escape_text(str(value)))
                 v.set_focusable(False)
-                box.append(v)
+                lines.append(v)
             if buttons:
                 brow = Gtk.Box(spacing=6, margin_top=4)
                 for blabel, fn in buttons:
@@ -3274,7 +5450,8 @@ class Guy:
             if not run("playerctl", "-l"):
                 say = "Nothing is playing"
             else:
-                run("playerctl", action)
+                # the player GUY shows (what's playing), not whichever playerctl lists first
+                run("playerctl", *(("-p", self.media.now["player"]) if self.media.now else ()), action)
                 if action in ("pause", "play"):
                     say = "Paused" if action == "pause" else "Playing"
                 elif action in ("next", "previous"):
@@ -3310,7 +5487,7 @@ class Guy:
         return say
 
     def open_thing(self, name):
-        """Open an app (or switch to it if it's already open), a folder, or a website. None if nothing fits."""
+        """Open an app (or switch to it if it's already open), a folder, a file, or a website. None if nothing fits."""
         q = re.sub(r"[^\w\s.+-]", "", name).strip()
         if not q:
             return None
@@ -3333,7 +5510,7 @@ class Guy:
         if apps:
             a = max(apps, key=lambda a: score(q, a["name"], a["extra"]))
             if score(q, a["name"], a["extra"]) >= 35:
-                spawn("uwsm", "app", "--", a["id"])
+                launch(a["id"])
                 return f"Opening {a['name']}"
             # a misheard name: "this cord" is Discord, "spot a fly" is Spotify; compare them without spaces
             squash = re.sub(r"\W", "", q.lower())
@@ -3347,7 +5524,7 @@ class Guy:
                     return f"Switching to {app['name'] if app else w['class']}"
             a = max(apps, key=lambda a: near(a["name"]))
             if near(a["name"]) >= 0.75:
-                spawn("uwsm", "app", "--", a["id"])
+                launch(a["id"])
                 return f"Opening {a['name']}"
         key = re.sub(r"\s+(?:folder|directory)$", "", q.lower())
         special = {"downloads": GLib.UserDirectory.DIRECTORY_DOWNLOAD, "documents": GLib.UserDirectory.DIRECTORY_DOCUMENTS,
@@ -3366,6 +5543,10 @@ class Guy:
         if folder:
             spawn("xdg-open", folder)
             return f"Opening {os.path.basename(folder.rstrip('/')) or 'your home folder'}"
+        hits = FILES.search(q, 1)
+        if hits and hits[0][0] >= 60 * len(q.split()) - 10:     # every word starts the name or a word in it
+            open_path(hits[0][1])
+            return f"Opening {os.path.basename(hits[0][1])}"
         if re.fullmatch(r"[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:/\S*)?", key):
             spawn("xdg-open", "https://" + key)
             return f"Opening {key}"
@@ -3925,10 +6106,8 @@ class Guy:
         isl.tw, isl.th, isl.h = isl.w, 0.0, 0.0     # the edge lets go of it at once
         isl.follow = True
         self.place_float()
-        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.EXCLUSIVE if self.mode == "ask"
-                                     else LayerShell.KeyboardMode.ON_DEMAND)
         isl.queue_allocate()
-        self.save_float()
+        self.after_snap()                          # (Ask keeps the keyboard it has)
         self.kick()
 
     def start_pull(self):
@@ -3993,9 +6172,20 @@ class Guy:
         self.mode = None                         # whatever it shows now, it shows it in the orb
         self.stack.set_visible(False)
         self.pending = None
-        LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.ON_DEMAND)
         self.apply()
-        self.save_float()
+        self.after_snap()
+
+    def after_snap(self):
+        """Once the snap has played: let GUY take the keyboard when clicked, and remember he's out. Not in
+        the snap's own frame: changing the keyboard mode makes the compositor reconfigure the window, and
+        that frame was dropped."""
+        def later():
+            if self.floating and not self.absorbing:
+                if self.mode != "ask":
+                    LayerShell.set_keyboard_mode(self.win, LayerShell.KeyboardMode.ON_DEMAND)
+                self.save_float()
+            return False
+        GLib.timeout_add(450, later)
 
     def cancel_pull(self):
         isl = self.island
@@ -4166,6 +6356,8 @@ class Guy:
                 self.news.refresh()
             if self.stocks.stale():
                 self.stocks.refresh()
+            if self.mail.stale():
+                self.mail.refresh()
             self.apply()
 
     # ----- files dragged onto the island -----
@@ -4206,6 +6398,16 @@ class Guy:
             return False
         if ev.get("guy_command") == "activity":
             self.on_activity_command(ev)
+            return False
+        if ev.get("guy_command") == "outfit":
+            self.wardrobe.force(ev.get("outfit"))
+            return False
+        if ev.get("guy_command") == "mail":      # guy --add-mail / --remove-mail changed the accounts
+            self.mail.refresh()
+            self.mail.start_push()
+            return False
+        if ev.get("guy_command") == "code":
+            self.mail.lookup_code()
             return False
         if ev.get("guy_command") == "float":
             self.dock() if self.floating else self.pop_out()
@@ -4347,6 +6549,8 @@ class Guy:
         if self.user_mode != "ask":
             self.apps = load_apps()
             self.windows = load_windows()
+            if FILES.stale():
+                FILES.build()
             self.icon_by_class = {}
             for a in self.apps:
                 self.icon_by_class.setdefault(a["id"].removesuffix(".desktop").lower(), a["icon"])
@@ -4412,11 +6616,13 @@ class Guy:
         self.footer.set_label(hint)
 
     def on_changed(self, _entry):
-        self.mode_list = "search"
-        self.file_gen += 1
         text = self.entry.get_text()
         if self.view == "answer":
             return                               # a follow-up: the chat stays, Enter sends it
+        if self.mode_list == "files" and text.strip():
+            self.search_files()                  # Alt+F: files only, as you type
+            return
+        self.mode_list = "search"
         self.refresh(text)
 
     def refresh(self, text):
@@ -4440,6 +6646,39 @@ class Guy:
                           "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
             items.append({"kind": "web", "title": f"Search Google for “{q}”", "subtitle": "Opens in your browser",
                           "icon": "web-browser", "hint": "Ctrl+↵", "query": q})
+        elif q and self.mail.boxes and CODE_WORDS.fullmatch(q):
+            c = self.mail.code
+            if c and time.time() - c["at"] < 900:
+                to = c.get("to") or mail_labels(mail_accounts()[0]).get(c["address"], c["address"])
+                items.append({"kind": "code", "title": c["code"], "subtitle": f"{c['sender']} → {to}  ·  {age(c['at'])}"
+                              + "  ·  Enter to copy and type it in", "icon": "dialog-password-symbolic", "hint": "Enter"})
+            else:
+                items.append({"kind": "code", "title": "Find my verification code",
+                              "subtitle": "Looks through the last 15 minutes of mail in every account",
+                              "icon": "dialog-password-symbolic", "hint": "Enter"})
+            items.append({"kind": "claude", "title": f"Ask GUY: {q}", "subtitle": "Answer right here",
+                          "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
+        elif q and self.mail.boxes and MAIL_WORDS.fullmatch(q):
+            for b in self.mail.boxes:
+                where = f"{b['label']}  ·  " if len(self.mail.boxes) > 1 else ""
+                if b["error"]:
+                    items.append({"kind": "link", "title": f"{b['label']}: {b['error']}", "subtitle": b["address"],
+                                  "icon": "mail-unread-symbolic", "hint": "Gmail", "url": mail_link(b["address"])})
+                for m in b["items"][:MAX_APPS]:
+                    items.append({"kind": "link", "title": m["subject"],
+                                  "subtitle": f"{where}{m['sender']}  ·  {age(m['when']) if m['when'] else ''}",
+                                  "icon": "mail-unread-symbolic", "hint": "Open", "url": m["link"]})
+            if not any(b["items"] for b in self.mail.boxes):
+                items.append({"kind": "info", "title": "No unread mail", "subtitle": "Checked " + age(self.mail.fetched)
+                              + (" ago" if time.time() - self.mail.fetched >= 60 else ""),
+                              "icon": "mail-read-symbolic", "hint": ""})
+            items.append({"kind": "claude", "title": f"Ask GUY: {q}", "subtitle": "Answer right here",
+                          "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
+        elif q and CAL_WORDS.search(q):
+            items.append({"kind": "claude", "title": f"Ask GUY: {q}",
+                          "subtitle": "GUY puts it in your Google Calendar" if cal_accounts()
+                          else "Link Google Calendar first: guy --add-calendar (see the README)",
+                          "icon": "x-office-calendar", "hint": "Enter", "query": q})
         elif q and (said := intents(q)):
             icon = {"timer": "alarm-symbolic", "timer-cancel": "alarm-symbolic", "open": "system-run-symbolic",
                     "dismiss": "window-close-symbolic",
@@ -4469,6 +6708,8 @@ class Guy:
                                   "subtitle": f"{w['class']}  ·  desktop {w.get('workspace', {}).get('name', '?')}",
                                   "icon": self.icon_by_class.get(w["class"].lower(), w["class"].lower()),
                                   "hint": "Switch", "window": w})
+            if len(q) > 1:
+                items += self.file_items(q, MAX_FILES_INLINE)
             follow = "Follow up" if self.history else "Ask GUY"
             items.append({"kind": "claude", "title": f"{follow}: {q}", "subtitle": "Answer right here",
                           "icon": "dialog-question-symbolic", "hint": "Tab", "query": q})
@@ -4569,7 +6810,7 @@ class Guy:
             subprocess.run(["wl-copy", item["value"]])
             self.close_ask()
         elif kind == "app":
-            spawn("uwsm", "app", "--", item["app"]["id"])
+            launch(item["app"]["id"])
             self.close_ask()
         elif kind == "window":
             addr = item["window"]["address"]
@@ -4584,6 +6825,12 @@ class Guy:
         elif kind == "stock":
             spawn("xdg-open", stock_url(item["symbol"]))
             self.close_ask()
+        elif kind == "link":
+            spawn("xdg-open", item["url"])
+            self.close_ask()
+        elif kind == "code":
+            self.close_ask()                     # the browser gets the keyboard back, then GUY types
+            GLib.timeout_add(350, lambda: self.mail.lookup_code() and False)
         elif kind == "watch":
             self.stocks.watch(item["symbol"], item["on"])
             self.refresh(self.entry.get_text())
@@ -4592,44 +6839,30 @@ class Guy:
             spawn("xdg-open", "https://www.google.com/search?q=" + urllib.parse.quote_plus(item["query"]))
             self.close_ask()
         elif kind == "file":
-            spawn("xdg-open", item["path"])
             self.close_ask()
+            open_path(item["path"])
 
     def search_files(self):
+        """Alt+F: only files and folders, more of them."""
         term = self.entry.get_text().strip()
         if not term:
             return
-        self.file_gen += 1
-        gen = self.file_gen
         self.mode_list = "files"
-        self.show_items([{"kind": "info", "title": f"Searching files for “{term}”…", "subtitle": "",
-                          "icon": "folder-saved-search", "hint": ""}])
-
-        def work():
-            try:
-                out = subprocess.run(["fd", "-i", "-F", "--max-results", str(MAX_FILES), "--", term, str(HOME)],
-                                     capture_output=True, text=True, timeout=15).stdout.splitlines()
-            except (OSError, subprocess.SubprocessError):
-                out = []
-            GLib.idle_add(self.show_files, gen, term, out)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def show_files(self, gen, term, paths):
-        if gen != self.file_gen:
-            return False
-        items = []
-        for p in paths:
-            is_dir = p.endswith("/")
-            path = p.rstrip("/")
-            items.append({"kind": "file", "title": os.path.basename(path),
-                          "subtitle": os.path.dirname(path).replace(str(HOME), "~", 1),
-                          "icon": "folder" if is_dir else "text-x-generic", "hint": "Open", "path": path})
+        items = self.file_items(term, MAX_FILES)
         if not items:
-            items = [{"kind": "info", "title": f"No files matching “{term}”", "subtitle": "",
-                      "icon": "dialog-information-symbolic", "hint": ""}]
+            items = [{"kind": "info", "title": f"No files matching “{term}”" if FILES.data else "Indexing your files…",
+                      "subtitle": "", "icon": "dialog-information-symbolic", "hint": ""}]
         self.show_items(items)
-        return False
+        self.footer.set_label("Files  ·  Enter open  ·  Shift+Enter show in folder  ·  Esc back")
+
+    def file_items(self, q, limit):
+        items = []
+        for _s, path, is_dir in FILES.search(q, limit):
+            where = os.path.dirname(path)
+            where = "~" + where[len(str(HOME)):] if where.startswith(str(HOME)) else where
+            items.append({"kind": "file", "title": os.path.basename(path), "subtitle": where,
+                          "icon": file_icon(path, is_dir), "hint": "Folder" if is_dir else "File", "path": path})
+        return items
 
     def ask_claude(self, query, voice=False, shown=None):
         """shown: what the chat shows as your question, when the prompt itself is long (the news brief)."""
@@ -4826,6 +7059,9 @@ class Guy:
                 self.spinner.stop()
                 self.set_view("idle")
                 self.refresh(self.entry.get_text())
+            elif self.mode_list == "files":
+                self.mode_list = "search"
+                self.refresh(self.entry.get_text())
             else:
                 self.close_ask(explicit=True)
             return True
@@ -4852,7 +7088,12 @@ class Guy:
                 self.close_ask()
             elif self.view == "results":
                 row = self.listbox.get_selected_row()
-                self.activate_index(row.get_index() if row else 0)
+                idx = row.get_index() if row else 0
+                if shift and 0 <= idx < len(self.items) and self.items[idx]["kind"] == "file":
+                    self.close_ask()
+                    show_in_folder(self.items[idx]["path"])
+                else:
+                    self.activate_index(idx)
             elif self.view == "answer" or self.attachment:
                 self.ask_claude(text)
             return True
