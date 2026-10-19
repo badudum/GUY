@@ -187,6 +187,14 @@ guy --remove-calendar you@gmail.com
 
 GUY only gets access to events (not your other Google data), and the token is kept in your keyring.
 
+**Reservations from your texts.** When a text on your paired iPhone looks like a reservation or
+appointment ("Your table for 2 at Tacofino, Fri Oct 10 at 7:30 PM is confirmed"), the pill pops out
+with **click to add to calendar** (or use **Add reservation to calendar** on the iPhone row in the
+overview). Spotting it happens on your computer; only when you click is that one text sent to GUY's
+assistant, which adds it with the place and confirmation number, checks it isn't there already, and
+asks first if the text cancels or moves a booking. A "confirmation code" in such a text is never typed
+in as a sign-in code. Switch it off with `{"bookings": false}` in `~/.config/guy/phone.json`.
+
 #### Verification codes
 
 The same push connection hears about new mail in any tab, not just Primary. When a new email holds a sign-in or verification code, he finds it on your computer (the
