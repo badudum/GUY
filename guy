@@ -927,7 +927,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Gtk4LayerShell", "1.0")
-from gi.repository import Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
 from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 
 try:  # newer GLib moved it; the old name still works but warns
@@ -940,6 +940,45 @@ except (ValueError, ImportError):
 HOME = Path.home()
 FLOAT_STATE = HOME / ".local/state/guy/float.json"
 SOCK = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "guy.sock"
+
+
+def hypr_socket(name):
+    """One of Hyprland's sockets: .socket.sock for requests, .socket2.sock for its event stream."""
+    base = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "hypr"
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if sig and (base / sig / name).exists():
+        return base / sig / name
+    socks = sorted(base.glob(f"*/{name}"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not socks:
+        raise FileNotFoundError("no Hyprland socket")
+    return socks[0]
+
+
+def hypr_monitors():
+    """The screens Hyprland has right now (its `monitors` JSON), or [] when it can't be asked."""
+    import socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect(str(hypr_socket(".socket.sock")))
+            s.sendall(b"j/monitors")
+            data = b""
+            while chunk := s.recv(65536):
+                data += chunk
+        return json.loads(data)
+    except (OSError, ValueError):
+        return []
+
+
+def focused_monitor():
+    """The name of the screen the pointer is on (Hyprland's focused monitor), or None."""
+    return next((m["name"] for m in hypr_monitors() if m.get("focused")), None)
+
+
+def laptop_monitor():
+    """Where GUY goes when his screen is unplugged: the built-in one, else whichever is left."""
+    names = [m["name"] for m in hypr_monitors() if not m.get("disabled")]
+    return next((n for n in names if n.startswith("eDP")), names[0] if names else None)
 
 # the layer surface never resizes; the island is drawn inside it and the input region follows it
 SURF_W, SURF_H = 880, 700
@@ -2814,6 +2853,7 @@ class Island(Gtk.Widget):
         super().__init__()
         self.content = content
         content.set_parent(self)
+        self.nudge = 0             # bumped to force a frame out (see do_snapshot)
         self.w, self.h, self.vw, self.vh = float(HIDDEN_W), 0.0, 0.0, 0.0
         self.tw, self.th = float(HIDDEN_W), 0.0
         # the floating glass and where it's heading
@@ -2837,7 +2877,6 @@ class Island(Gtk.Widget):
         # so each piece is drawn at the origin, cached by its shape, and only moved (or, for small changes
         # of size like a wobble or a stretch, scaled) from frame to frame
         self.nodes = {}
-        self.animating = False   # the springs are running: the quick glass; full quality once they stop
 
     def geometry(self):
         s = min(SHOULDER + min(abs(self.vw) * 0.006, 8), self.h / 2)
@@ -2925,6 +2964,10 @@ class Island(Gtk.Widget):
 
     def do_snapshot(self, snap):
         W = self.get_width()
+        # one corner pixel, invisible, a different shade each time the input region changes: an empty frame
+        # is skipped, and the new region only reaches the compositor with a frame that's actually sent
+        snap.append_color(Gdk.RGBA(red=0, green=0, blue=0, alpha=(1 + self.nudge % 2) / 255),
+                          Graphene.Rect().init(0, 0, 1, 1))
         dock = self.h >= 0.5
         if not dock and not self.fvis:
             return
@@ -2935,7 +2978,6 @@ class Island(Gtk.Widget):
         fr = self.float_radius()
         nw = self.neck() if dock else 0.0
         P = SHADOW_PAD
-        moving = self.animating    # not from speeds: flipping on a threshold mid-drag made the glass flicker
         if nw > 0.5:
             # joined by a neck (a small drop, pulled out or coming home): one outline, drawn as it is
             top = max(self.h + bulge, fy + fh)
@@ -2947,16 +2989,24 @@ class Island(Gtk.Widget):
             snap.append_node(node)
         else:
             if dock:
-                # drawn at x = 0 and moved into place; a stretch scales it from the middle of the top edge
+                # drawn at x = 0 and moved into place; a stretch scales it from the middle of the top edge.
+                # Settling (within 5% of its size, no drip): the glass it settles into, scaled, so the last
+                # half of an open or close reuses one drawing instead of a new one every frame
                 w, h = self.w, self.h
-                key = (round(w, 1), round(h, 1), round(s, 1), round(r, 1), round(bulge, 1), moving)
+                tw, th = self.tw, self.th
+                ts, tr = min(SHOULDER, th / 2), max(0.0, min(RADIUS, th / 2, tw / 2))
+                if (th > 8 and tw > 8 and bulge < 0.5 and abs(s - ts) < 0.5
+                        and 0.95 <= w / tw <= 1.05 and 0.95 <= h / th <= 1.05):
+                    w, h, s, r, bulge = tw, th, ts, tr, 0.0
+                key = (round(w, 1), round(h, 1), round(s, 1), round(r, 1), round(bulge, 1))
                 node = self.cached("dock", key, (-s - P, 0, w + 2 * (s + P), h + bulge + P), lambda cr: draw_glass(
                     cr, lambda c, closed: island_path(c, 0, w, h, s, r, bulge, closed),
-                    (-s, 0, w + 2 * s, h + bulge), fade=h * 0.8, fast=moving))
+                    (-s, 0, w + 2 * s, h + bulge), fade=h * 0.8))
+                sx, sy = self.sx * self.w / w, self.sy * self.h / h
                 snap.save()
-                if self.sx != 1.0 or self.sy != 1.0:
+                if sx != 1.0 or sy != 1.0:
                     snap.translate(Graphene.Point().init(W / 2, 0))
-                    snap.scale(self.sx, self.sy)
+                    snap.scale(sx, sy)
                     snap.translate(Graphene.Point().init(-w / 2, 0))
                 else:
                     snap.translate(Graphene.Point().init(self.snap(W / 2 - w / 2), 0))
@@ -2982,10 +3032,10 @@ class Island(Gtk.Widget):
                 else:
                     gw, gh = round(fw, 1), round(fh, 1)
                 gr = min(gw, gh) / 2 if max(gw, gh) <= ORB + 4 else RADIUS
-                key = (gw, gh, gr, round(self.ring, 2), moving)
+                key = (gw, gh, gr, round(self.ring, 2))
                 node = self.cached("float", key, (-P, -P, gw + 2 * P, gh + 2 * P + GLASS["shadow_offset"]),
                                    lambda cr: draw_glass(cr, lambda c, _closed: float_path(c, 0, 0, gw, gh, gr),
-                                                         (0, 0, gw, gh), fast=key[-1], ring=self.ring))
+                                                         (0, 0, gw, gh), ring=self.ring))
                 snap.save()
                 snap.translate(Graphene.Point().init(self.snap(fx), self.snap(fy)))
                 if (gw, gh) != (fw, fh):
@@ -3292,7 +3342,7 @@ class PacmanWatcher:
         self.act.state = "done" if ok else "error"
         self.act.updated = time.time()
         self.guy.pop(self.act, 6.0)
-        GLib.timeout_add_seconds(5, self.guy.check_updates)
+        GLib.timeout_add_seconds(5, lambda: self.guy.check_updates() and False)
 
     def line(self, line):
         m = self.LINE.match(line)
@@ -4098,6 +4148,21 @@ PHONE_RETRY = 60                  # seconds between tries to reach the phone, at
 PHONE_RETRY_MAX = 600             # backing off to this while it stays away (each try pages the radio)
 PHONE_KEEP = 30                   # messages kept for the overview
 MAS_UUID = "00001132-0000-1000-8000-00805f9b34fb"     # Bluetooth Message Access, on the phone
+# a reservation or appointment: one of these words, and a day or time, and not an ad or a sign-in code
+BOOKING_WORDS = re.compile(r"\b(?:reserv\w*|book(?:ing|ed)|appointment|appt|confirm\w*|table for \d+|party of \d+|"
+                           r"check[- ]?in|scheduled|see you (?:on|at)|your (?:visit|stay|table|flight|ride|tour|class|"
+                           r"session))\b", re.I)
+BOOKING_WHEN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?m\b|\b\d{1,2}:\d{2}\b|\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\b|"
+                          r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.? \d{1,2}\b|\b\d{1,2}/\d{1,2}\b|"
+                          r"\b(?:today|tonight|tomorrow)\b", re.I)
+NOT_BOOKING = re.compile(r"\b(?:unsubscribe|reply stop|txt stop|promo|sale ends|deal|verif\w*|one[- ]time|passcode|2fa|"
+                         r"log ?in|sign[- ]?in)\b|% off", re.I)
+
+
+def is_booking(text):
+    """Whether a text looks like a reservation or appointment confirmation (decided here, on this computer)."""
+    t = " ".join((text or "").split())
+    return bool(BOOKING_WORDS.search(t) and BOOKING_WHEN.search(t) and not NOT_BOOKING.search(t))
 
 
 def parse_bmessage(b):
@@ -4119,8 +4184,10 @@ class PhoneWatcher:
     (iPhone: Settings > Bluetooth > ⓘ). GUY reaches for it while it's away (every minute, backing off to every
     10), downloads each new
     message on this computer (never sends it anywhere), pops it up at the top, and copies and types in
-    verification codes the same way as from mail. ~/.config/guy/phone.json: {"address": "AA:BB:..."} picks
-    the phone when several are paired, {"phone": false} switches it off."""
+    verification codes the same way as from mail. A reservation or appointment confirmation pops up with
+    "click to add to calendar"; only then is that one text sent to GUY's assistant, to put in Google Calendar.
+    ~/.config/guy/phone.json: {"address": "AA:BB:..."} picks the phone when several are paired,
+    {"phone": false} switches it off, {"bookings": false} just the reservations."""
 
     def __init__(self, guy):
         self.guy = guy
@@ -4238,9 +4305,16 @@ class PhoneWatcher:
         return False
 
     def got(self, sender, text):
-        self.messages = ([{"when": time.time(), "sender": sender, "text": text}] + self.messages)[:PHONE_KEEP]
-        code = find_code("", text)
-        if code:
+        booking = self.config().get("bookings", True) is not False and is_booking(text)
+        self.messages = ([{"when": time.time(), "sender": sender, "text": text, "booking": booking}]
+                         + self.messages)[:PHONE_KEEP]
+        # a reservation's "confirmation code RX7P2Q" isn't a sign-in code: never type it into the browser
+        code = None if booking else find_code("", text)
+        if booking:
+            self.guy.chime()
+            self.guy.flash(f"📅 {sender}: {' '.join(text.split())}  ·  click to add to calendar", "done", 20,
+                           click=lambda: self.guy.add_booking(sender, text))
+        elif code:
             c = {"code": code, "sender": sender, "address": None, "to": "iPhone", "at": time.time()}
             self.guy.mail.code = c               # so guy --code and Ask GUY "code" find it too
             self.guy.use_code(c, fill=mail_accounts()[1].get("autofill", True) is not False)
@@ -4559,10 +4633,13 @@ class Guy:
         self.user_mode = None      # "home" or "ask" when the user opened one
         self.hover = False
         self.dragging = False
+        self.dragging_out = False  # a file result being dragged out of Ask into another app
+        self.drag_failed = False
         self.pointer = None
         self.flash_until, self.flash_text, self.flash_mood = 0.0, "", "idle"
         self.linger_until = 0.0    # after Ask closes, the pill it shrank into stays this long
         self.flash_act = None      # an activity the pill is popped out for, shown live
+        self.flash_click = None    # what clicking the popped-out pill does, for this flash
         self.prompt = None         # a terminal waiting for you: {"kind", "pid", "text"}
         self.voice_state = None    # "listening" / "thinking" while you talk to GUY
         self.voice_words = ""      # what you've said so far, live
@@ -4591,6 +4668,7 @@ class Guy:
         self.reaching = False      # dragged near the top edge: the island reaches down for him
         self.home = None           # the flight home, phase by phase (see dock)
         self.input_all = False     # the whole surface takes the pointer (while dragging)
+        self.input_rects = None    # (surface, rects) last given to the compositor as clickable
         self.aside_until = 0.0     # guy-computer is using the screen: clicks pass through the orb
         self.home_expanded = None  # the overview row that's open, showing everything about it
         self.home_shown = None     # what the overview's rows were last built from
@@ -4697,6 +4775,23 @@ class Guy:
         GLib.timeout_add_seconds(20, lambda: self.check_updates() and False)
         GLib.timeout_add_seconds(1800, self.check_updates)
 
+        # which screen: docked, he hangs from the top of the screen the pointer is on; pulled out, he stays on
+        # the screen he was left on; a screen unplugged sends him back to the laptop's
+        self.monitor_name = None       # the screen GUY is on
+        self.cursor_monitor = focused_monitor()
+        try:
+            saved = json.loads(FLOAT_STATE.read_text())
+            start = saved.get("monitor") if saved.get("floating") else None
+        except (OSError, ValueError, AttributeError):
+            start = None
+        self.move_to(start if self.gdk_monitor(start) else self.cursor_monitor)
+        # an unplugged screen takes its surfaces with it: the compositor closes them, which closes the window
+        win.connect("close-request", lambda w: self.surface_closed(w))
+        win.connect("map", lambda _w: GLib.idle_add(self.reset_input_region))
+        catcher.connect("close-request", lambda w: self.surface_closed(w))
+        threading.Thread(target=self.watch_monitors, daemon=True).start()
+        GLib.timeout_add(250, self.follow_cursor)
+
         win.present()
         GLib.idle_add(self.update_input_region)
         GLib.timeout_add(400, self.restore_float)
@@ -4717,9 +4812,18 @@ class Guy:
         self.peek_label.add_css_class("peek-label")
         box.append(self.peek_label)
         click = Gtk.GestureClick()
-        click.connect("released", lambda *_: self.focus_prompt() if self.prompt else self.open_home())
+        click.connect("released", lambda *_: self.on_peek_click())
         box.add_controller(click)
         return box
+
+    def on_peek_click(self):
+        if self.prompt:
+            self.focus_prompt()
+        elif self.flash_click and time.monotonic() < self.flash_until:
+            act, self.flash_click, self.flash_until = self.flash_click, None, 0.0
+            act()
+        else:
+            self.open_home()
 
     def build_orb(self):
         box = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
@@ -4846,6 +4950,7 @@ class Guy:
 
         self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE, activate_on_single_click=True)
         self.listbox.add_css_class("results")
+        self.result_rows = []      # its rows, reused from one keystroke to the next (see show_items)
         self.listbox.connect("row-activated", lambda _lb, r: self.activate_index(r.get_index()))
         self.list_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
                                               propagate_natural_height=True, max_content_height=420)
@@ -5140,8 +5245,12 @@ class Guy:
             summary = f"{last['sender']}: {' '.join(last['text'].split())}" if last else "No new messages"
             more = [("", f"{self.phone.name} connected" if self.phone.name else "iPhone not in range")]
             more += [(f"{m['sender']}  ·  {age(m['when'])}", m["text"] or "(no text)") for m in self.phone.messages]
+            buttons = [("Clear", self.clear_texts)] if last else []
+            if booking := next((m for m in self.phone.messages if m.get("booking")), None):
+                buttons.insert(0, ("Add reservation to calendar",
+                                   lambda m=booking: self.add_booking(m["sender"], m["text"])))
             self.add_row(icon, "iPhone", summary, age(last["when"]) if last else None, key="phone", more=more,
-                         buttons=[("Clear", self.clear_texts)] if last else (), scroll=260)
+                         buttons=buttons, scroll=260)
         if mail:
             unread = sum(b["unread"] for b in mail)
             icon = Gtk.Image.new_from_icon_name("mail-unread-symbolic" if unread else "mail-read-symbolic")
@@ -5235,6 +5344,19 @@ class Guy:
         self.ask_claude("Here's my unread email (sender and subject only). In a few lines: what looks like it "
                         "needs me, and what can wait. Don't open or look up the emails.\n\n" + lines,
                         shown="Brief me on my mail")
+
+    def add_booking(self, sender, text):
+        """GUY reads a reservation text (this one only, now that you asked) and puts it in your calendar."""
+        self.user_mode = None
+        self.open_ask()
+        self.ask_claude(f"This text from {sender} looks like a reservation or appointment. Put it in my Google "
+                        "Calendar with guy --cal-add: a short title (what and where, like \"Dinner at Tacofino\"), "
+                        "the date and time, --where with the place or address if it says, and in --notes the "
+                        "confirmation number and party size if there are any. No end time given: guess a usual "
+                        "length (dinner 2h, a haircut 1h). Check guy --calendar first and don't add it twice. If "
+                        "it cancels or moves a booking, say what you'd change and ask before deleting anything. "
+                        "If it has no date or time to go on, say so instead of guessing.\n\n" + text,
+                        shown=f"Add {sender}'s reservation to my calendar")
 
     def small_button(self, label, fn):
         b = Gtk.Button(label=label)
@@ -5802,6 +5924,7 @@ class Guy:
     def pop(self, act, seconds):
         """Pop the pill out showing an activity, live, then let it slide back in."""
         self.flash_act = act
+        self.flash_click = None
         self.flash_mood = "working" if act.state == "running" else act.state
         self.flash_until = time.monotonic() + seconds
         GLib.timeout_add(int(seconds * 1000) + 50, self.apply)
@@ -5830,8 +5953,10 @@ class Guy:
         self.hover = False
         self.apply()
 
-    def flash(self, text, mood, seconds):
+    def flash(self, text, mood, seconds, click=None):
+        """click: what clicking the pill does while this shows (instead of opening the overview)."""
         self.flash_act = None
+        self.flash_click = click
         self.flash_text, self.flash_mood = text, mood
         self.flash_until = time.monotonic() + seconds
         GLib.timeout_add(int(seconds * 1000) + 50, self.apply)
@@ -5918,7 +6043,6 @@ class Guy:
                                          and abs(isl.fw - isl.tfw) < 0.3 and abs(isl.fh - isl.tfh) < 0.3
                                          and max(abs(isl.vfx), abs(isl.vfy), abs(isl.vfw), abs(isl.vfh)) < 2))
                    and isl.goo in (0.0, 1.0) and (isl.bridge == 0.0 or not isl.fvis) and isl.sx == 1.0 and isl.sy == 1.0 and not isl.stretching)
-        isl.animating = not settled
         if settled:
             isl.w, isl.h, isl.vw, isl.vh = isl.tw, isl.th, 0.0, 0.0
             if isl.fvis:
@@ -5937,7 +6061,7 @@ class Guy:
         isl = self.island
         W, H = isl.get_width(), isl.get_height()
         if self.input_all:                       # dragging: follow the pointer anywhere
-            surf.set_input_region(cairo.Region(cairo.RectangleInt(0, 0, W, H)))
+            self.set_input_rects(surf, [(0, 0, W, H)])
             return False
         cx = W / 2
         rects = []
@@ -5949,10 +6073,142 @@ class Guy:
                 rects.append((cx - isl.w / 2 - s, 0, isl.w + 2 * s, max(HOT_H, isl.h + bulge)))
         if isl.fvis and time.monotonic() >= self.aside_until:
             rects.append(isl.float_rect())
+        self.set_input_rects(surf, rects)
+        return False
+
+    def set_input_rects(self, surf, rects):
+        """Hand the compositor the clickable part of the surface, only when it changed: the island's tick
+        calls this every frame, and most frames (a wobble, the panel's contents moving) it's the same."""
+        rects = [tuple(int(round(v)) for v in rect) for rect in rects]
+        if (surf, rects) == self.input_rects:
+            return
+        self.input_rects = (surf, rects)
         region = cairo.Region()
         for rect in rects:
-            region.union(cairo.RectangleInt(*(int(round(v)) for v in rect)))
+            region.union(cairo.RectangleInt(*rect))
         surf.set_input_region(region)
+        # the region only reaches the compositor with the next frame; hidden, GUY draws none, so make one
+        # (after a move to another screen the hot strip otherwise never arrives and the top edge is dead)
+        self.island.nudge += 1
+        self.island.queue_draw()
+
+    # ----- which screen -----
+    def gdk_monitor(self, name):
+        if not name:
+            return None
+        mons = Gdk.Display.get_default().get_monitors()
+        for i in range(mons.get_n_items()):
+            mon = mons.get_item(i)
+            if mon.get_connector() == name and mon.is_valid():
+                return mon
+        return None
+
+    def move_to(self, name):
+        """Put GUY (and the catcher behind Ask) on screen `name`. The surface is remapped there."""
+        mon = self.gdk_monitor(name)
+        if mon is None or (name == self.monitor_name and LayerShell.get_monitor(self.win) == mon):
+            return False
+        self.monitor_name = name
+        # hidden, moved, shown: set_monitor on a shown window remaps it underneath GTK, and the remapped
+        # surface never gets pointer events (the hot strip goes dead until Ask GUY rebuilds it)
+        for w in (self.win, self.catcher):
+            shown = w.get_visible()
+            if shown:
+                w.set_visible(False)
+            LayerShell.set_monitor(w, mon)
+            if shown:
+                w.present()
+        # the surface is remapped on the new screen a moment later, with no input region: hidden, nothing
+        # redraws him, so give it the hot strip again once it's there (on map, and in case that's missed)
+        for delay in (50, 200, 600):
+            GLib.timeout_add(delay, self.reset_input_region)
+        return True
+
+    def reset_input_region(self):
+        self.input_rects = None
+        self.update_input_region()
+        return False
+
+    def can_follow(self):
+        """Docked and not in the middle of anything: free to go to the screen the pointer is on. Pulled
+        out he stays where he was left; with Ask open (or a pull, a flight home) he waits until it's done."""
+        return not (self.floating or self.pulling or self.absorbing or self.retracting or self.grab
+                    or self.mode == "ask")
+
+    def follow_cursor(self):
+        """Every 250 ms (and on every focusedmon event): catch up with the pointer's screen when free to."""
+        if self.cursor_monitor and self.cursor_monitor != self.monitor_name and self.can_follow():
+            self.move_to(self.cursor_monitor)
+        return True
+
+    def watch_monitors(self):
+        """Hyprland's event stream: which screen the pointer is on, and screens being unplugged."""
+        import socket
+        while True:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.connect(str(hypr_socket(".socket2.sock")))
+                    buf = b""
+                    while chunk := s.recv(4096):
+                        buf += chunk
+                        *lines, buf = buf.split(b"\n")
+                        for line in lines:
+                            name, _, data = line.decode(errors="ignore").partition(">>")
+                            if name == "focusedmon":
+                                GLib.idle_add(self.cursor_on, data.split(",", 1)[0])
+                            elif name == "monitorremovedv2":          # id,name,description
+                                GLib.idle_add(self.monitor_removed, data.split(",")[1])
+            except (OSError, IndexError):
+                pass
+            time.sleep(2)
+
+    def cursor_on(self, name):
+        self.cursor_monitor = name
+        self.follow_cursor()
+        return False
+
+    def monitor_removed(self, name):
+        """A screen was unplugged. If GUY was on it he comes back to the laptop, docked or floating."""
+        if name == self.cursor_monitor:
+            self.cursor_monitor = focused_monitor()
+        if name == self.monitor_name:
+            self.monitor_name = None
+            self.move_to(laptop_monitor())
+            if self.floating:
+                GLib.timeout_add(300, self.keep_float_on_screen)
+        return False
+
+    def keep_float_on_screen(self):
+        """On a smaller screen than before, the floating GUY is brought back inside it."""
+        if self.floating:
+            self.anchor = self.clamp_anchor(*self.anchor)
+            self.place_float()
+            self.island.queue_allocate()
+            self.kick()
+            self.save_float()
+        return False
+
+    def surface_closed(self, w):
+        """The compositor closed a surface (its screen went away): keep the window and bring it back on
+        a screen that's still there."""
+        GLib.idle_add(self.reopen, w)
+        return True
+
+    def reopen(self, w):
+        if w is self.catcher:
+            w.set_visible(False)
+            if self.mode == "ask":
+                self.close_ask()
+            return False
+        live = {m["name"] for m in hypr_monitors()}
+        self.monitor_name = self.monitor_name if self.monitor_name in live else None
+        self.move_to(self.monitor_name or laptop_monitor())
+        w.set_visible(False)
+        w.present()
+        self.input_rects = None
+        GLib.idle_add(self.update_input_region)
+        if self.floating:
+            GLib.timeout_add(300, self.keep_float_on_screen)
         return False
 
     # ----- pulled out: floating GUY -----
@@ -6295,7 +6551,8 @@ class Guy:
     def save_float(self):
         try:
             FLOAT_STATE.parent.mkdir(parents=True, exist_ok=True)
-            FLOAT_STATE.write_text(json.dumps({"floating": self.floating, "x": self.anchor[0], "y": self.anchor[1]}))
+            FLOAT_STATE.write_text(json.dumps({"floating": self.floating, "x": self.anchor[0], "y": self.anchor[1],
+                                               "monitor": self.monitor_name}))
         except OSError:
             pass
 
@@ -6362,6 +6619,8 @@ class Guy:
 
     # ----- files dragged onto the island -----
     def on_drag_enter(self, _t, _x, _y):
+        if self.dragging_out:                    # our own file result on its way out: not a drop on GUY
+            return 0
         self.dragging = True
         self.apply()
         return Gdk.DragAction.COPY
@@ -6376,6 +6635,8 @@ class Guy:
         return False
 
     def on_drop(self, _t, value, _x, _y):
+        if self.dragging_out:
+            return False
         self.dragging = False
         files = [f.get_path() for f in value.get_files() if f.get_path()]
         if not files:
@@ -6752,35 +7013,176 @@ class Guy:
                          "symbol": top, "on": not on})
         return items
 
+    def result_row(self):
+        """One row of the results list, appended to it: (row, icon, title, subtitle, hint)."""
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(spacing=14)
+        img = Gtk.Image()
+        img.set_pixel_size(30)
+        box.append(img)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
+        title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        title.add_css_class("rtitle")
+        texts.append(title)
+        sub = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        sub.add_css_class("rsub")
+        texts.append(sub)
+        box.append(texts)
+        hint = Gtk.Label(valign=Gtk.Align.CENTER)
+        hint.add_css_class("hint")
+        box.append(hint)
+        row.set_child(box)
+        # a file or folder result can be dragged out into another app, or right-clicked for Open with
+        drag = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+        drag.connect("prepare", lambda _s, _x, _y: self.drag_prepare(row))
+        drag.connect("drag-begin", lambda s, _d: self.drag_begin(s, img))
+        drag.connect("drag-cancel", lambda _s, _d, _r: self.drag_cancelled())
+        drag.connect("drag-end", lambda _s, _d, _del: self.drag_end())
+        row.add_controller(drag)
+        menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        menu.connect("pressed", lambda _g, _n, x, y: self.file_menu(row, x, y))
+        row.add_controller(menu)
+        self.listbox.append(row)
+        return row, img, title, sub, hint
+
+    # ----- a file result dragged out, or right-clicked -----
+    def row_file(self, row):
+        idx = row.get_index()
+        if 0 <= idx < len(self.items) and self.items[idx]["kind"] == "file":
+            return self.items[idx]["path"]
+        return None
+
+    def drag_prepare(self, row):
+        """What a dragged file result carries: the file itself (text/uri-list), which browsers, file
+        managers and terminals all take. Other rows don't drag."""
+        path = self.row_file(row)
+        if path is None:
+            return None
+        files = Gdk.FileList.new_from_list([Gio.File.new_for_path(path)])
+        return Gdk.ContentProvider.new_for_value(GObject.Value(Gdk.FileList, files))
+
+    def drag_begin(self, source, img):
+        """The file's icon goes with the pointer. The catcher behind Ask steps aside so the drop lands on
+        the app under it, and GUY's own "drop a file to ask about it" ignores this drag."""
+        self.dragging_out, self.drag_failed = True, False
+        source.set_icon(Gtk.WidgetPaintable.new(img), 15, 15)
+        self.catcher.set_visible(False)
+
+    def drag_cancelled(self):
+        self.drag_failed = True
+        return False
+
+    def drag_end(self):
+        """Dropped somewhere: Ask's done. Let go over nothing: Ask stays, with its catcher back."""
+        self.dragging_out = False
+        if self.dragging:
+            self.dragging = False
+            self.apply()
+        if not self.drag_failed:
+            self.close_ask()
+        elif self.mode == "ask":
+            self.catcher.present()
+
+    def file_menu(self, row, x, y):
+        """Right-click on a file result: Open, Show in folder, Copy path, and Open with each app that
+        handles its type (the usual ones first, the rest under Other applications)."""
+        path = self.row_file(row)
+        if path is None:
+            return
+        self.listbox.select_row(row)
+        ctype = "inode/directory" if os.path.isdir(path) else Gio.content_type_guess(path, None)[0]
+        default = Gio.AppInfo.get_default_for_type(ctype, False)
+        apps, seen = [], set()
+        for app in ([default] if default else []) + Gio.AppInfo.get_recommended_for_type(ctype):
+            if app.get_id() and app.get_id() not in seen and app.should_show():
+                apps.append(app)
+                seen.add(app.get_id())
+        others = sorted((a for a in Gio.AppInfo.get_all_for_type(ctype)
+                         if a.get_id() and a.get_id() not in seen and a.should_show()),
+                        key=lambda a: a.get_display_name().lower())
+
+        def entry(app):
+            item = Gio.MenuItem.new(app.get_display_name(), None)
+            item.set_action_and_target_value("file.open-with", GLib.Variant("s", app.get_id()))
+            if app.get_icon():
+                item.set_icon(app.get_icon())
+            return item
+
+        menu = Gio.Menu()
+        top = Gio.Menu()
+        top.append("Open", "file.open")
+        top.append("Show in folder", "file.show")
+        top.append("Copy path", "file.copy")
+        menu.append_section(None, top)
+        with_menu = Gio.Menu()
+        for app in apps:
+            with_menu.append_item(entry(app))
+        if others:
+            more = Gio.Menu()
+            for app in others:
+                more.append_item(entry(app))
+            with_menu.append_submenu("Other applications", more)
+        if apps or others:
+            menu.append_section("Open with", with_menu)
+
+        def act(name, fn, ptype=None):
+            action = Gio.SimpleAction.new(name, ptype)
+            action.connect("activate", lambda _a, v: fn(v))
+            group.add_action(action)
+
+        def open_with(app_id):
+            self.close_ask()
+            launch(app_id, path)
+            FILES.opened(path)
+
+        def copy_path():
+            subprocess.run(["wl-copy", path])
+            self.footer.set_label("Copied " + path)
+
+        group = Gio.SimpleActionGroup()
+        act("open", lambda _v: (self.close_ask(), open_path(path)))
+        act("show", lambda _v: (self.close_ask(), show_in_folder(path)))
+        act("copy", lambda _v: copy_path())
+        act("open-with", lambda v: open_with(v.get_string()), GLib.VariantType.new("s"))
+        row.insert_action_group("file", group)
+        pop = Gtk.PopoverMenu.new_from_model_full(menu, Gtk.PopoverMenuFlags.NESTED)
+        pop.set_parent(row)
+        pop.set_has_arrow(False)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
+
     def show_items(self, items):
+        """The rows are kept and refilled, not rebuilt: this runs on every keystroke, and making a row's
+        widgets (and styling them) cost more than finding what goes in it. Rows past the end are hidden."""
         self.items = items
-        while (row := self.listbox.get_row_at_index(0)) is not None:
-            self.listbox.remove(row)
-        for item in items:
-            row = Gtk.ListBoxRow()
+        while len(self.result_rows) < len(items):
+            self.result_rows.append(self.result_row())
+        for i, (row, img, title, sub, hint) in enumerate(self.result_rows):
+            row.set_visible(i < len(items))
+            if i >= len(items):
+                continue
+            item = items[i]
             if item["kind"] == "calc":
                 row.add_css_class("calc")
-            box = Gtk.Box(spacing=14)
+            else:
+                row.remove_css_class("calc")
             icon = item["icon"]
-            img = Gtk.Image.new_from_gicon(icon) if isinstance(icon, Gio.Icon) else Gtk.Image.new_from_icon_name(icon)
-            img.set_pixel_size(30)
-            box.append(img)
-            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
-            title = Gtk.Label(label=item["title"], xalign=0, ellipsize=Pango.EllipsizeMode.END)
-            title.add_css_class("rtitle")
-            texts.append(title)
-            if item.get("subtitle"):
-                sub = Gtk.Label(label=item["subtitle"], xalign=0, ellipsize=Pango.EllipsizeMode.END)
-                sub.add_css_class("rsub")
-                texts.append(sub)
-            box.append(texts)
-            hint = Gtk.Label(label=item.get("hint", ""), valign=Gtk.Align.CENTER)
-            hint.add_css_class("hint")
-            box.append(hint)
-            row.set_child(box)
-            self.listbox.append(row)
+            if isinstance(icon, Gio.Icon):
+                img.set_from_gicon(icon)
+            else:
+                img.set_from_icon_name(icon)
+            title.set_label(item["title"])
+            sub.set_label(item.get("subtitle") or "")
+            sub.set_visible(bool(item.get("subtitle")))
+            hint.set_label(item.get("hint", ""))
         if items:
             self.listbox.select_row(self.listbox.get_row_at_index(0))
+            self.list_scroll.get_vadjustment().set_value(0)
+        else:
+            self.listbox.unselect_all()
         if self.view != "answer":
             self.set_view("results" if items else "idle")
 
