@@ -2410,6 +2410,388 @@ class Face(Gtk.DrawingArea):
             cr.restore()
 
 
+# ---------- Claudes at work: one little critter per busy Claude, in a ring round the penguin ----------
+# What's busy comes from $XDG_RUNTIME_DIR/claude-at-work (see Guy.read_claudes): a file per Claude Code
+# session from claude-at-work-hook, and one per answering claude.ai tab from its Chrome extension.
+CLAUDE_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "claude-at-work"
+CLAUDE_ORANGE = (0.851, 0.467, 0.341)
+CLAUDE_INK = (0.10, 0.08, 0.07)
+CLAUDE_SPARK = (1.0, 0.86, 0.45)
+CLAUDE_AMBER = (1.0, 0.72, 0.24)
+
+
+class Runner:
+    def __init__(self, kind, angle):
+        self.kind = kind             # "run", "web" (claude.ai), "wait" (needs you), "done", "sleep" (idle), "gone"
+        self.angle = angle           # where in the ring
+        self.phase = random.random() * 4
+        self.alpha = 0.0
+        self.since = time.monotonic()
+
+
+class Crowd(Gtk.Widget):
+    """Over the island, click-through: the busy Claudes playing ring-around-the-rosie round the penguin while
+    he's out (the far side goes behind him), and the idle ones asleep at his feet. Each critter is its
+    own small cairo node, so a frame only repaints where they are. Ticks only while he's out with some."""
+    __gtype_name__ = "GuyCrowd"
+
+    COLS, ROWS = 15, 8              # the sprite, in sprite pixels
+    PIXEL = 1.6                     # logical px per sprite pixel: 2 screen pixels at a 1.25 scale
+    SPIN = 0.55                     # rad/s round the ring
+    FALL_EVERY, FALL_FOR = 24.0, 1.6   # "...we all fall down", every so often
+
+    def __init__(self, island, faces):
+        super().__init__()
+        self.island, self.faces = island, faces
+        self.set_can_target(False)
+        self.runners = {}            # key -> Runner
+        self.turn = 0.0              # the ring's rotation
+        self.ring = None             # (cx, cy, rx, ry, face rect) while he's out
+        self.tick = None
+        self.last = None
+        self.drawn_at = 0.0
+        self.away_since = None       # when he went in (no penguin on screen)
+        self.started = time.monotonic()
+
+    def set_claudes(self, kinds):
+        """kinds: key -> "run" / "web" / "wait" / "done" / "sleep", for every Claude about right now."""
+        for key, kind in kinds.items():
+            r = self.runners.get(key)
+            if r is None:
+                self.runners[key] = Runner(kind, self.turn + random.uniform(0, 2 * math.pi))
+            elif r.kind != kind:
+                r.kind, r.since = kind, time.monotonic()
+        for key, r in self.runners.items():
+            if key not in kinds and r.kind not in ("gone", "done"):
+                r.kind, r.since = "gone", time.monotonic()
+        self.wake()
+
+    def wake(self):
+        """Tick again (he may be out); on_tick stops once he's been away a second."""
+        if self.runners and self.tick is None:
+            self.last, self.away_since = None, None
+            self.tick = self.add_tick_callback(self.on_tick)
+
+    def penguin(self):
+        """The penguin that's on screen (the orb, the pill, an open panel), in our coordinates."""
+        if self.island.alpha < 0.3:
+            return None
+        best = None
+        for f in self.faces():
+            if not f.get_mapped():
+                continue
+            ok, b = f.compute_bounds(self)
+            if ok and b.get_width() > 4 and (best is None or b.get_width() > best.get_width()):
+                best = b
+        return best
+
+    def on_tick(self, _w, clock):
+        t = clock.get_frame_time() / 1e6
+        dt = min(1 / 20, t - self.last) if self.last else 1 / 60
+        self.last = t
+        now = time.monotonic()
+        face = self.penguin()
+        if face is not None:
+            S = face.get_width()
+            cx, cy = face.get_x() + S / 2, face.get_y() + face.get_height() / 2
+            rx = S * 0.55 + self.COLS * self.PIXEL * 0.75
+            self.ring = (cx, cy + S * 0.22, rx, rx * 0.34, face)
+        else:
+            self.ring = None
+        self.turn += self.SPIN * dt
+        # holding hands: everyone eases toward an even share of the ring, keeping their order
+        ring = sorted((r for r in self.runners.values() if r.kind not in ("gone", "sleep")),
+                      key=lambda r: (r.angle - self.turn) % (2 * math.pi))
+        wants = {id(r): self.turn + 2 * math.pi * i / max(1, len(ring)) for i, r in enumerate(ring)}
+        # the sleepers: side by side in front of his feet (the near side of the ring), in a row
+        sleepers = [r for _k, r in sorted(self.runners.items()) if r.kind == "sleep"]
+        for i, r in enumerate(sleepers):
+            wants[id(r)] = math.pi / 2 + (i - (len(sleepers) - 1) / 2) * min(0.7, 2.6 / max(1, len(sleepers)))
+        for r in self.runners.values():
+            if id(r) in wants:
+                d = (wants[id(r)] - r.angle + math.pi) % (2 * math.pi) - math.pi
+                r.angle += d * min(1, dt * 2.5)
+        for key, r in list(self.runners.items()):
+            if r.kind == "gone":
+                r.angle += self.SPIN * dt
+            fade_out = r.kind == "gone" or (r.kind == "done" and now - r.since > 2.6)
+            r.alpha = max(0.0, r.alpha - dt / 0.4) if fade_out else min(1.0, r.alpha + dt / 0.3)
+            if fade_out and r.alpha <= 0:
+                del self.runners[key]
+        if not self.runners:
+            self.queue_draw()
+            self.tick = None
+            return False
+        if self.ring is None:                    # he's gone in: clear them away, and rest till he's out
+            if self.drawn_at:
+                self.drawn_at = 0.0
+                self.queue_draw()
+            self.away_since = self.away_since or now
+            if now - self.away_since > 1.0:
+                self.tick = None
+                return False
+            return True
+        self.away_since = None
+        # 30 fps is plenty for little legs; sleepers only breathe
+        fps = 30 if any(r.kind != "sleep" for r in self.runners.values()) else 12
+        if t - self.drawn_at >= 1 / (fps + 1):
+            self.drawn_at = t
+            self.queue_draw()
+        return True
+
+    def fallen(self, now):
+        """0..1: how far down they all are ("...ashes, ashes, we all fall down")."""
+        t = (now - self.started) % self.FALL_EVERY
+        if t > self.FALL_FOR:
+            return 0.0
+        return min(1.0, t / 0.25, (self.FALL_FOR - t) / 0.35)
+
+    def do_snapshot(self, snap):
+        if not self.runners or self.ring is None:
+            return
+        cx, cy, rx, ry, face = self.ring
+        native = self.get_native()
+        surf = native.get_surface() if native else None
+        sc = surf.get_scale() if surf else 1.0
+        P = max(1, round(self.PIXEL * sc)) / sc
+        W, H = self.COLS * P, self.ROWS * P
+        now = time.monotonic()
+        fall = self.fallen(now)
+        # far side first, so the near ones overlap them
+        for r in sorted(self.runners.values(), key=lambda r: math.sin(r.angle)):
+            if r.alpha <= 0:
+                continue
+            x, y = cx + rx * math.cos(r.angle), cy + ry * math.sin(r.angle)
+            behind = math.sin(r.angle) < 0
+            left = math.sin(r.angle) > 0          # the near side runs left, the far side right
+            ox = round((x - W / 2) * sc) / sc
+            oy = round((y - H) * sc) / sc         # standing on the ring
+            rect = Graphene.Rect().init(ox - 7 * P, oy - 12 * P, W + 14 * P, H + 14 * P)   # room for a hop, "!", sparkles
+            cr = snap.append_cairo(rect)
+            if behind:                            # behind him: hidden where his body is
+                cr.rectangle(ox - 7 * P, oy - 12 * P, W + 14 * P, H + 14 * P)
+                fx, fy, fw, fh = face.get_x(), face.get_y(), face.get_width(), face.get_height()
+                cr.save()
+                cr.translate(fx + fw / 2, fy + fh * 0.55)
+                cr.scale(fw * 0.36, fh * 0.46)
+                cr.arc_negative(0, 0, 1, 0, -2 * math.pi)
+                cr.restore()
+                cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+                cr.clip()
+            cr.push_group()
+            if fall > 0 and r.kind in ("run", "web") and r.kind != "sleep":
+                # tipped over sideways, the way he was going
+                cr.translate(ox + W / 2, oy + H)
+                cr.rotate((-1 if left else 1) * fall * math.pi / 2)
+                cr.translate(-(ox + W / 2), -(oy + H))
+            self.draw_critter(cr, r, ox, oy, P, left, now, still=fall > 0)
+            cr.pop_group_to_source()
+            cr.paint_with_alpha(r.alpha * (0.8 if behind else 1.0))
+
+    def draw_critter(self, cr, r, ox, oy, P, left, now, still=False):
+        """Claude's critter drawn the way GUY is: soft shapes, a gradient, a floor shadow, a glassy highlight
+        and a thin rim, squash and stretch. Inside (ox, oy, W, H), feet on the bottom edge."""
+        W, H = self.COLS * P, self.ROWS * P
+        cx, ground = ox + W / 2, oy + H
+        age = now - r.since
+        bw, bh = W * 0.66, H * 0.56               # the body
+        leg_h = H * 0.26
+        lift, sq = 0.0, 0.0                      # raised off the floor; squash (+) / stretch (-)
+        legs = [0.0] * 4                         # leg swing, radians
+        arms = [0.35, 0.35]                      # back / front arm, raised by
+        eyes, wave = "open", 0.0
+        if r.kind in ("run", "web", "gone") and not still:
+            st = now * 2 * math.pi * 2.4 + r.phase * 2
+            lift = abs(math.cos(st)) * H * 0.09
+            sq = -0.05 * abs(math.cos(st)) + 0.05 * abs(math.sin(st))
+            swing = math.sin(st) * 0.5
+            legs = [swing, -swing, swing, -swing]
+            arms = [0.35 - swing * 0.9, 0.35 + swing * 0.9]
+        elif r.kind == "wait" and not still:     # hopping, waving, "!"
+            ph = (now * 1.6 + r.phase) % 1
+            lift = math.sin(ph * math.pi) * H * 0.45
+            sq = 0.16 * (1 - ph) ** 6 - 0.06 * math.sin(ph * math.pi)
+            wave = math.sin(now * 12)
+            arms = [1.9 + wave * 0.35, 1.9 - wave * 0.35]
+        elif r.kind == "done":                   # one happy hop, arms up, sparkles
+            if age < 0.7:
+                lift = math.sin(age / 0.7 * math.pi) * H * 0.5
+            arms, eyes = [2.2, 2.2], "happy"
+        elif r.kind == "sleep":                  # curled up: legs tucked, breathing slowly, eyes shut
+            leg_h = H * 0.07
+            sq = 0.07 + 0.05 * math.sin(now * 1.7 + r.phase * 3)
+            arms, eyes = [-0.15, -0.15], "shut"
+            left = False                          # all facing the same way
+        if left:                                 # facing the way he's going
+            cr.translate(cx, 0)
+            cr.scale(-1, 1)
+            cr.translate(-cx, 0)
+
+        def rounded(x, y, w, h, rad):
+            rad = min(rad, w / 2, h / 2)
+            cr.new_sub_path()
+            cr.arc(x + w - rad, y + rad, rad, -math.pi / 2, 0)
+            cr.arc(x + w - rad, y + h - rad, rad, 0, math.pi / 2)
+            cr.arc(x + rad, y + h - rad, rad, math.pi / 2, math.pi)
+            cr.arc(x + rad, y + rad, rad, math.pi, 1.5 * math.pi)
+            cr.close_path()
+
+        # the floor, under him: smaller and fainter the higher he is
+        k = max(0.3, 1 - lift / H)
+        sh = cairo.RadialGradient(cx, ground, 0, cx, ground, bw * 0.6 * k)
+        sh.add_color_stop_rgba(0, 0, 0, 0, 0.32 * k)
+        sh.add_color_stop_rgba(1, 0, 0, 0, 0)
+        cr.save()
+        cr.translate(cx, ground)
+        cr.scale(1, 0.22)
+        cr.translate(-cx, -ground)
+        cr.set_source(sh)
+        cr.arc(cx, ground, bw * 0.6 * k, 0, 2 * math.pi)
+        cr.fill()
+        cr.restore()
+
+        base = ground - lift
+        top = base - leg_h - bh
+        light, deep = (0.95, 0.60, 0.46), (0.76, 0.38, 0.26)
+        fur = cairo.LinearGradient(0, top, 0, base)
+        fur.add_color_stop_rgb(0, *light)
+        fur.add_color_stop_rgb(1, *deep)
+
+        cr.save()
+        cr.translate(cx, base)
+        cr.scale(1 + sq, 1 - sq)                 # squash and stretch, from his feet
+        cr.translate(-cx, -base)
+        # legs: little rounded stubs, swinging in pairs
+        lw = bw * 0.12
+        for n, fx in enumerate((-0.36, -0.13, 0.13, 0.36)):
+            hip_x, hip_y = cx + fx * bw, base - leg_h - lw * 0.5
+            cr.save()
+            cr.translate(hip_x, hip_y)
+            cr.rotate(legs[n])
+            rounded(-lw / 2, 0, lw, leg_h + lw * 0.5, lw / 2)
+            shade = 0.88 if n % 2 else 1.0       # the far pair a touch darker
+            cr.set_source_rgb(*(c * shade for c in deep))
+            cr.fill()
+            cr.restore()
+        # arms: nubs on either side, behind the body for the far one
+        aw, al = bh * 0.32, bw * 0.2
+
+        def arm(side, raise_by, shade):
+            cr.save()
+            cr.translate(cx + side * bw * 0.47, top + bh * 0.5)
+            cr.rotate(-side * raise_by + (math.pi / 2 if side > 0 else -math.pi / 2))
+            rounded(-aw / 2, 0, aw, al, aw / 2)
+            cr.set_source_rgb(*(c * shade for c in light))
+            cr.fill()
+            cr.restore()
+
+        arm(-1, arms[0], 0.86)
+        # body
+        rounded(cx - bw / 2, top, bw, bh, bh * 0.32)
+        body = cr.copy_path()
+        cr.set_source(fur)
+        cr.fill()
+        arm(1, arms[1], 1.0)
+        # a soft glassy highlight and a thin rim, in the same light as the island
+        cr.save()
+        cr.translate(cx - bw * 0.22, top + bh * 0.24)
+        cr.rotate(-0.25)
+        cr.scale(bw * 0.2, bh * 0.14)
+        hl = cairo.RadialGradient(0, 0, 0, 0, 0, 1)
+        hl.add_color_stop_rgba(0, 1, 1, 1, 0.45)
+        hl.add_color_stop_rgba(1, 1, 1, 1, 0)
+        cr.set_source(hl)
+        cr.arc(0, 0, 1, 0, 2 * math.pi)
+        cr.fill()
+        cr.restore()
+        cr.append_path(body)
+        cr.set_source_rgba(1, 1, 1, 0.18)
+        cr.set_line_width(max(0.5, W * 0.025))
+        cr.stroke()
+        # eyes: Claude's tall dark ones, with a glint, looking where he's going
+        ew, eh = bw * 0.1, bh * 0.36
+        blink = 1.0 if (now * 0.7 + r.phase) % 4 > 0.12 else 0.15
+        for fx in (-0.2, 0.26):
+            ex, ey = cx + fx * bw + bw * 0.03, top + bh * 0.42
+            if eyes == "shut":                   # a sleepy curve, down
+                cr.set_source_rgb(*CLAUDE_INK)
+                cr.set_line_width(ew * 0.8)
+                cr.set_line_cap(cairo.LINE_CAP_ROUND)
+                cr.arc(ex, ey - eh * 0.1, ew * 0.85, math.pi * 0.15, math.pi * 0.85)
+                cr.stroke()
+                continue
+            if eyes == "happy":
+                cr.set_source_rgb(*CLAUDE_INK)
+                cr.set_line_width(ew * 0.9)
+                cr.set_line_cap(cairo.LINE_CAP_ROUND)
+                cr.arc(ex, ey + eh * 0.15, ew * 0.9, math.pi * 1.15, math.pi * 1.85)
+                cr.stroke()
+                continue
+            rounded(ex - ew / 2, ey - eh / 2 * blink, ew, eh * blink, ew / 2)
+            cr.set_source_rgb(*CLAUDE_INK)
+            cr.fill()
+            if blink > 0.5:
+                cr.arc(ex + ew * 0.12, ey - eh * 0.22, ew * 0.24, 0, 2 * math.pi)
+                cr.set_source_rgba(1, 1, 1, 0.85)
+                cr.fill()
+        cr.restore()
+
+        if left:                                 # back to normal for what isn't him
+            cr.translate(cx, 0)
+            cr.scale(-1, 1)
+            cr.translate(-cx, 0)
+        if r.kind == "web" and not still:        # claude.ai: a little trail of white
+            for n in range(3):
+                d = ((now * 3 + n / 3) % 1)
+                tx = cx + (1 if left else -1) * (bw * 0.55 + d * W * 0.35)
+                cr.arc(tx, top + bh * 0.55, W * 0.03 * (1 - d), 0, 2 * math.pi)
+                cr.set_source_rgba(1, 1, 1, 0.8 * (1 - d))
+                cr.fill()
+        if r.kind == "wait" and (now * 3) % 3 < 2.2:   # "!" with a warm glow
+            gx, gy = cx + bw * 0.62, top - H * 0.15
+            glow = cairo.RadialGradient(gx, gy, 0, gx, gy, H * 0.5)
+            glow.add_color_stop_rgba(0, *CLAUDE_AMBER, 0.45)
+            glow.add_color_stop_rgba(1, *CLAUDE_AMBER, 0)
+            cr.set_source(glow)
+            cr.arc(gx, gy, H * 0.5, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgb(*CLAUDE_AMBER)
+            rounded(gx - W * 0.035, gy - H * 0.32, W * 0.07, H * 0.38, W * 0.035)
+            cr.fill()
+            cr.arc(gx, gy + H * 0.16, W * 0.04, 0, 2 * math.pi)
+            cr.fill()
+        if r.kind == "sleep":                    # z's drifting up and away
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_line_join(cairo.LINE_JOIN_ROUND)
+            for n in range(2):
+                d = (now * 0.45 + r.phase + n * 0.5) % 1
+                size = W * (0.08 + 0.1 * d)
+                zx = cx + bw * 0.35 + d * W * 0.3
+                zy = top - d * H * 0.9
+                cr.set_source_rgba(1, 1, 1, 0.85 * math.sin(d * math.pi))
+                cr.set_line_width(max(0.6, W * 0.028))
+                cr.move_to(zx - size / 2, zy - size / 2)
+                cr.line_to(zx + size / 2, zy - size / 2)
+                cr.line_to(zx - size / 2, zy + size / 2)
+                cr.line_to(zx + size / 2, zy + size / 2)
+                cr.stroke()
+        if r.kind == "done":                     # twinkling four-point stars
+            for n, (sx, sy) in enumerate(((-0.55, -0.1), (0.6, 0.05), (-0.3, -0.55), (0.35, -0.6))):
+                tw = max(0.0, math.sin(now * 7 + n * 1.7))
+                if tw <= 0.05:
+                    continue
+                px_, py_ = cx + sx * W, top + sy * H
+                size = W * 0.09 * tw
+                cr.move_to(px_, py_ - size)
+                for a in range(1, 9):
+                    rr = size if a % 2 == 0 else size * 0.3
+                    ang = -math.pi / 2 + a * math.pi / 4
+                    cr.line_to(px_ + math.cos(ang) * rr, py_ + math.sin(ang) * rr)
+                cr.close_path()
+                cr.set_source_rgba(*CLAUDE_SPARK, 0.95)
+                cr.fill()
+
+
 # ---------- the island: a liquid-glass shape hanging from the top edge ----------
 def squircle_corner(cr, cx, cy, r, t0, t1, steps=14):
     """A quarter superellipse like Hyprland's rounding_power corners, from angle t0 to t1."""
@@ -4707,7 +5089,12 @@ class Guy:
         self.stack.set_visible(False)
         self.island = Island(self.stack)
         self.island.on_target = self.retarget
-        win.set_child(self.island)
+        # the Claudes running around him, drawn over the glass, never in the way of a click
+        self.crowd = Crowd(self.island, lambda: self.faces)
+        overlay = Gtk.Overlay()
+        overlay.set_child(self.island)
+        overlay.add_overlay(self.crowd)
+        win.set_child(overlay)
         drag = Gtk.GestureDrag()
         drag.connect("drag-begin", self.on_grab)
         drag.connect("drag-update", self.on_grab_move)
@@ -4796,6 +5183,12 @@ class Guy:
         GLib.idle_add(self.update_input_region)
         GLib.timeout_add(400, self.restore_float)
         GLib.timeout_add_seconds(60, self.prune)
+        self.claude_check = None
+        self.claude_soon = None
+        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+        self.claude_monitor = Gio.File.new_for_path(str(CLAUDE_DIR)).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self.claude_monitor.connect("changed", lambda *_: self.claudes_changed())
+        self.read_claudes()
         self.flash("Hi, I'm GUY  ·  Alt+Space to ask me", "done", 3.0)
 
     # ----- pages -----
@@ -5053,6 +5446,7 @@ class Guy:
         return "idle"
 
     def apply(self):
+        self.crowd.wake()                         # he may be coming out: the Claudes with him
         mode = self.compute_mode()
         self.refresh_pages(mode)
         isl = self.island
@@ -6743,6 +7137,66 @@ class Guy:
             self.sessions.pop(sid, None)
         self.apply()
         return keep
+
+    # ----- Claudes at work -----
+    def claudes_changed(self):
+        if self.claude_soon is None:              # a hook writes a temp file and renames it: one read
+            self.claude_soon = GLib.timeout_add(80, self.read_claudes_soon)
+
+    def read_claudes_soon(self):
+        self.claude_soon = None
+        self.read_claudes()
+        return False
+
+    def read_claudes(self):
+        """Every busy Claude, from $XDG_RUNTIME_DIR/claude-at-work: Claude Code sessions (claude-at-work-hook:
+        pid, state, detail, folder, time) and answering claude.ai tabs (web-*, from the Chrome extension,
+        repeated every 10 s while it answers). Each busy one is a critter running round the penguin; each open
+        Claude Code session that isn't doing anything sleeps at his feet."""
+        kinds = {}
+        now = time.time()
+        try:
+            entries = list(CLAUDE_DIR.iterdir())
+        except OSError:
+            entries = []
+        for path in entries:
+            if path.name.startswith("."):
+                continue
+            try:
+                pid, state, _detail, _cwd, at = path.read_text().rstrip("\n").split("\t")
+                pid, at = int(pid), float(at)
+            except (OSError, ValueError):
+                continue
+            if path.name.startswith("web-"):
+                if state == "web" and now - at < 75:
+                    kinds[path.name] = "web"
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue                          # Claude Code is gone (quit without SessionEnd)
+            except PermissionError:
+                pass
+            if state in ("thinking", "writing", "reading", "running") and now - at < 900:
+                kinds[path.name] = "run"
+            elif state == "waiting" and now - at < 900:
+                kinds[path.name] = "wait"
+            elif state == "done" and now - at < 3:
+                kinds[path.name] = "done"
+            else:
+                kinds[path.name] = "sleep"             # open, but not doing anything
+        self.crowd.set_claudes(kinds)
+        # while any are about, look again now and then: a tab that went quiet, a session that crashed
+        if any(k != "sleep" for k in kinds.values()) and self.claude_check is None:
+            self.claude_check = GLib.timeout_add_seconds(5, self.recheck_claudes)
+        return False
+
+    def recheck_claudes(self):
+        self.read_claudes()
+        if any(r.kind != "sleep" for r in self.crowd.runners.values()):
+            return True
+        self.claude_check = None
+        return False
 
     def on_hook_gone(self, conn):
         """The relay hung up: answered in the terminal, timed out, or the session ended."""

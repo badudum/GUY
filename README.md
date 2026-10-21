@@ -313,6 +313,19 @@ GUY is meant to sit there all day without costing anything: ~0.3% of one core wh
 | `~/.local/state/guy/voice.json` | whether "Hey GUY" is on |
 | `~/.local/state/guy/float.json` | whether GUY is pulled out, and where |
 
+## Claudes at work
+
+While GUY is out (floating, or the pill or a panel dropped down), every busy Claude plays
+ring-around-the-rosie round the penguin: one little critter, drawn in GUY's own style, per Claude Code
+session that's working and per claude.ai tab that's answering. The far side of the ring goes behind
+him, and every so often they all fall down. One waiting for you hops with a "!"; one that finishes hops
+with sparkles. Claude Code sessions that are open but idle curl up asleep at his feet, and hop up into
+the ring when they get busy. While GUY is tucked away the crowd doesn't draw at all.
+
+They're read from `$XDG_RUNTIME_DIR/claude-at-work`, which `~/.config/waybar/claude-at-work` fills:
+its Claude Code hook (`claude-at-work-hook`, a file per session) and its Chrome extension
+(`claude-at-work-host`, a `web-chrome-<tab>` file per answering tab). See the README there.
+
 ## Claude Code hooks
 
 ```sh
