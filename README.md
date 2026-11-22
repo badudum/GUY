@@ -209,6 +209,17 @@ Missed it, or want it again? Run `guy --code`, or type "code" in Ask GUY: the ne
 Switch the typing off with `"autofill": false` in `~/.config/guy/mail.json`, or the whole thing with
 `"codes": false` (new-mail notifications stay on).
 
+## Screen recording
+
+Say "record my screen" (or "record this window", "record an area", and "…with sound"), or run
+`guy --record screen|window|area [--sound]`. **area** lets you drag a box, or click a screen to take all
+of it (Esc cancels). While it records, the pill and the overview show the time with a **Stop** button;
+"stop recording", a click, or `guy --record stop` saves it to `~/Videos/Recordings` (the same folder and
+names as HyDE's `screenrecord`), and the row opens the video. **With sound** records what your speakers
+play, not the microphone. It uses `wf-recorder` with the GPU's H.264 encoder (VA-API), falling back to
+software if that's refused. `guy --record toggle` (area, or stop) is made for a key:
+`hl.bind("SUPER + SHIFT + R", hl.dsp.exec_cmd(os.getenv("HOME") .. "/.local/bin/guy --record toggle"))`.
+
 ## Reminders and routines
 
 Ask GUY ("remind me at 5pm to call mom", "every weekday at 8:30 give me a morning brief with the weather and
@@ -248,6 +259,7 @@ Ask GUY does these right away (Enter), without asking Claude:
 | "timer 25m", "set a timer for 10 minutes", "remind me in 5 minutes to call mom", "cancel timer" | a countdown on the pill; chimes, pops out and sends a notification when it's done |
 | "update packages", "update my system", "upgrade everything", "install updates", "yay -Syu" | opens kitty running `yay -Syu`, left open afterwards (the overview's **Update** button does the same) |
 | "google stock price", "GOOGL price", "$TSLA" | the price card (by voice, GUY says the price and today's change) |
+| "record my screen", "record this window", "record an area", "…with sound", "stop recording" | screen recording; see [Screen recording](#screen-recording) |
 | "lower sound and next song" | several at once |
 
 Track changes pop the pill with the song; the overview has a now-playing row with ⏮ ⏯ ⏭.

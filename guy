@@ -43,6 +43,24 @@ if sys.argv[1:2] == ["--outfit"]:
         sys.exit(1)
     sys.exit(0)
 
+# Screen recording, with wf-recorder, into ~/Videos/Recordings (where HyDE's screenrecord saves):
+#   guy --record [screen|window|area] [--sound]   start (area: drag a box, or click a screen)
+#   guy --record stop        guy --record toggle    (toggle = area, or stop if recording: for a key binding)
+if sys.argv[1:2] == ["--record"]:
+    _what = ([a for a in sys.argv[2:] if not a.startswith("-")] or ["screen"])[0]
+    if _what not in ("screen", "window", "area", "stop", "toggle"):
+        print("usage: guy --record [screen|window|area|toggle|stop] [--sound]", file=sys.stderr)
+        sys.exit(2)
+    try:
+        _send({"guy_command": "record", "what": _what, "sound": "--sound" in sys.argv[2:]})
+    except OSError:
+        if _what == "stop":      # GUY isn't running, but a recording it started might still be
+            import subprocess
+            sys.exit(subprocess.run(["pkill", "-INT", "-x", "wf-recorder"]).returncode)
+        print("guy: GUY isn't running", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
 # Reminders and routines, for you and for GUY's assistant (which sets them by running these):
 #   guy --remind "17:00" "call mom" [--every daily|weekdays|weekly|hourly]
 #   guy --task "08:30" "give me a morning brief: weather, calendar, news" --every weekdays
@@ -893,6 +911,7 @@ else:
 #   guy --voice on|off     switch "Hey GUY" listening on or off (the microphone closes when off)
 #   guy --add-mail ADDR    let GUY read a Gmail account (an app password, kept in the keyring)
 #   guy --code             copy (and type in) the newest verification code from your mail
+#   guy --record [screen|window|area] [--sound]   record the screen (guy --record stop saves it)
 #
 # Besides Claude Code it follows browser downloads (~/Downloads), pacman / yay as they run
 # (/var/log/pacman.log), and the number of available updates (HyDE's `hyde-shell system.update`).
@@ -1056,6 +1075,9 @@ clicking through a website or an app)
   Coordinates are the screenshot's pixels. Look, act, then take another screenshot to check it worked.
   Prefer keyboard shortcuts to clicking (Discord: ctrl+k, type the person's name, Return to open the chat,
   type the message, then send-key Return). Always use send-key, never key, for the final send.
+
+Screen recording (saved to ~/Videos/Recordings; GUY shows it running, with a Stop button)
+  guy --record screen|window|area [--sound]    area lets the user drag a box    guy --record stop
 
 Email (Gmail, read-only; never marks anything as read)
   guy --mail [--count N] [--all]   today's unread mail in each of the user's accounts (--all: older too): \
@@ -1752,6 +1774,18 @@ def intent_one(t):
             label = re.sub(r"\b(in |for )?\d+(\.\d+)?\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", "", label).strip()
             return "timer", (secs, label), f"Start a {fmt_duration(secs)} timer" + (f": {label}" if label else "")
         return None
+    # screen recording
+    if re.fullmatch(r"(?:stop|end|finish|quit|save|done)(?: the| my| this| that)?(?: screen)? ?"
+                    r"(?:recording|record|screencast|video)", t):
+        return "record-stop", None, "Stop recording and save it"
+    if m := re.fullmatch(r"(?:start |begin )?(?:a )?(?:screen ?)?(?:recording|record|screencast)(?: a video)?"
+                         r"(?: (?:of )?(?:my |the |this |an? )?(screen|display|monitor|window|app|area|region|selection"
+                         r"|part of (?:the |my )?screen))?(?: (?:with|and) (?:the |my )?(sound|audio))?", t):
+        what = {"window": "window", "app": "window", "area": "area", "region": "area", "selection": "area"}.get(
+            m[1], "area" if (m[1] or "").startswith("part") else "screen")
+        sound = bool(m[2])
+        return "record", (what, sound), {"screen": "Record the screen", "window": "Record this window",
+                                         "area": "Record an area (drag a box)"}[what] + (" with sound" if sound else "")
     # system update: yay -Syu in a terminal ("update" alone isn't enough, it could be a search)
     if re.fullmatch(r"(?:run |do |start )?(?:an? |the )?(?:system|package|full|arch) (?:update|upgrade)s?(?: now)?"
                     r"|(?:update|upgrade)(?: (?:all|my|the|of|every))*"
@@ -5038,6 +5072,7 @@ class Guy:
         self.sessions = {}
         self.approvals = []
         self.activities = {}
+        self.recorder = None       # the screen recording in progress (a dict), see start_recording
         self.updates = None        # (count, "pacman 10  ·  yay 2") from HyDE's checker
         self.faces = []
         # pulled out: floating on the screen instead of hanging from the top edge
@@ -5609,6 +5644,8 @@ class Guy:
                     trailing.append(b)
             elif a.kind == "timer" and a.state == "running":
                 trailing, when = self.small_button("Cancel", lambda k=a.key: self.remove_activity(k)), None
+            elif a.kind == "record" and a.state == "running":
+                trailing, when, click = self.small_button("Stop", self.stop_recording), None, self.stop_recording
             more = [("", a.title), ("", a.detail),
                     ("Status", {"running": "working on it…", "done": "done", "error": "failed"}.get(a.state, a.state))]
             self.add_row(icon, a.title, a.detail, when, click, a.progress, trailing, key=f"act:{a.key}", more=more)
@@ -5996,6 +6033,10 @@ class Guy:
             for k in timers:
                 del self.activities[k]
             say = "Timer cancelled" if len(timers) == 1 else f"{len(timers)} timers cancelled" if timers else "No timers running"
+        elif action == "record":
+            return self.start_recording(*arg)
+        elif action == "record-stop":
+            say = "Saving the recording" if self.stop_recording() else "Not recording"
         if say and not quiet:
             self.flash(say, "idle", 2.5)
         else:
@@ -6099,6 +6140,132 @@ class Guy:
             return False
         self.apply()
         return True
+
+    # ----- screen recording (wf-recorder, saved where HyDE's screenrecord saves) -----
+    def start_recording(self, what="screen", sound=False):
+        """Record GUY's screen, the focused window, or an area you drag (a click takes that whole screen).
+        sound records what the speakers play (not the microphone). Returns what GUY says about it."""
+        if self.recorder is not None:
+            self.flash("Already recording  ·  click to stop", "idle", 2.5, click=self.stop_recording)
+            return "Already recording"
+        if not shutil.which("wf-recorder"):
+            self.flash("Recording needs wf-recorder: sudo pacman -S wf-recorder", "error", 4.0)
+            return "I can't record: wf-recorder isn't installed"
+        self.recorder = {"proc": None}      # claimed now, so a second start while choosing an area is refused
+        self.close_ask()
+
+        def pick():
+            geo, out, err = None, None, None
+            if what == "window":
+                try:
+                    w = json.loads(run("hyprctl", "-j", "activewindow") or "{}")
+                    geo = "{},{} {}x{}".format(*w["at"], *w["size"]) if w.get("size") else None
+                except (ValueError, KeyError, TypeError):
+                    pass
+                err = None if geo else "No window to record"
+            elif what == "area":
+                time.sleep(0.3)             # let the Ask panel get out of the way first
+                try:
+                    r = subprocess.run(["slurp", "-o", "-w", "0", "-b", "#00000000", "-c", "#FFFFFF",
+                                        "-s", "#00000055", "-B", "#00000000"], capture_output=True, text=True)
+                    geo = r.stdout.strip() if r.returncode == 0 else None
+                except OSError:
+                    pass
+                err = None if geo else "Recording cancelled"
+            else:
+                out = focused_monitor()
+            GLib.idle_add(self.record_go, geo, out, err, sound)
+        threading.Thread(target=pick, daemon=True).start()
+        return {"screen": "Recording the screen", "window": "Recording the window",
+                "area": "Drag a box to record, or click a screen"}[what]
+
+    def record_go(self, geo, out, err, sound, hw=True):
+        if err:
+            self.recorder = None
+            self.flash(err, "idle", 2.5)
+            return False
+        folder = Path(os.environ.get("XDG_VIDEOS_DIR") or HOME / "Videos") / "Recordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / time.strftime("%y%m%d_%Hh%Mm%Ss_recording.mp4")
+        cmd = ["wf-recorder", "-y", "-f", str(path)] + (["-g", geo] if geo else ["-o", out] if out else [])
+        hw = hw and os.path.exists("/dev/dri/renderD128")
+        if hw:      # the GPU's encoder: next to no CPU (falls back to software if it refuses)
+            cmd += ["-c", "h264_vaapi", "-d", "/dev/dri/renderD128"]
+        if sound:
+            sink = run("pactl", "get-default-sink")
+            cmd.append(f"--audio={sink}.monitor" if sink else "--audio")
+        log = SOCK.parent / "guy-record.log"
+        try:
+            with open(log, "w") as f:
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=f)
+        except OSError as e:
+            self.recorder = None
+            self.flash(f"Couldn't start recording: {e}", "error", 4.0)
+            return False
+        rec = self.recorder = {"proc": proc, "path": path, "start": time.monotonic(), "geo": geo, "out": out,
+                               "sound": sound, "hw": hw, "log": log}
+        act = self.set_activity("record", "record", "Recording" + (" with sound" if sound else ""),
+                                "media-record-symbolic", detail="0:00")
+        act.state, act.progress, act.open = "running", None, None
+        threading.Thread(target=lambda: GLib.idle_add(self.record_ended, rec, proc.wait()), daemon=True).start()
+        GLib.timeout_add(1000, self.record_tick, rec)
+        if hw:      # announced once it has actually started (a refused hardware encoder dies at once)
+            GLib.timeout_add(1500, lambda: self.recorder is rec and self.flash(
+                "● Recording  ·  click to stop", "idle", 2.5, click=self.stop_recording) and False)
+        else:
+            self.flash("● Recording  ·  click to stop", "idle", 2.5, click=self.stop_recording)
+        return False
+
+    def record_tick(self, rec):
+        act = self.activities.get("record")
+        if self.recorder is not rec or act is None or rec.get("stopping"):
+            return False
+        act.detail = clock(time.monotonic() - rec["start"]) + "  ·  click to stop"
+        self.apply()
+        return True
+
+    def stop_recording(self):
+        """Stop and save the recording. False when nothing was recording."""
+        rec = self.recorder
+        if rec is None or rec.get("proc") is None:
+            # GUY may have restarted while a recording it started kept going
+            return subprocess.run(["pkill", "-INT", "-x", "wf-recorder"]).returncode == 0
+        rec["stopping"] = True
+        rec["proc"].send_signal(signal.SIGINT)
+        if act := self.activities.get("record"):
+            act.detail = "Saving…"
+        self.apply()
+        return True
+
+    def record_ended(self, rec, code):
+        if self.recorder is not rec:
+            return False
+        self.recorder = None
+        took = time.monotonic() - rec["start"]
+        path = rec["path"]
+        size = path.stat().st_size if path.exists() else 0
+        if rec["hw"] and not rec.get("stopping") and took < 3:
+            # the hardware encoder refused this size or screen: start again in software
+            path.unlink(missing_ok=True)
+            self.recorder = {"proc": None}
+            return self.record_go(rec["geo"], rec["out"], None, rec["sound"], hw=False)
+        act = self.set_activity("record", "record", "Screen recording", "media-record-symbolic")
+        act.updated = time.time()
+        if size and (rec.get("stopping") or code == 0):
+            act.state, act.progress, act.open = "done", None, str(path)
+            act.detail = f"{clock(took)}  ·  {human_size(size)}  ·  {path.name}"
+            self.chime()
+            self.flash(f"Recording saved  ·  {clock(took)}  ·  click to watch", "done", 5.0,
+                       click=lambda: spawn("xdg-open", str(path)))
+        else:
+            try:
+                why = [ln for ln in rec["log"].read_text(errors="replace").splitlines() if ln.strip()][-1][:120]
+            except (OSError, IndexError):
+                why = f"wf-recorder exited with {code}"
+            path.unlink(missing_ok=True)
+            act.state, act.progress, act.detail = "error", None, why
+            self.flash("Recording failed  ·  " + why, "error", 5.0)
+        return False
 
     # ----- voice (guy-voice does the listening and speaking) -----
     def voice_send(self, **msg):
@@ -7076,6 +7243,13 @@ class Guy:
             self.close_ask()
             self.apply()
             return False
+        if ev.get("guy_command") == "record":
+            what = ev.get("what", "screen")
+            if what == "stop" or (what == "toggle" and self.recorder is not None):
+                self.do_intent("record-stop", None)
+            else:
+                self.start_recording("area" if what == "toggle" else what, bool(ev.get("sound")))
+            return False
         if ev.get("guy_command") == "schedule":
             self.schedule = load_schedule()
             self.apply()
@@ -7396,7 +7570,8 @@ class Guy:
                           "icon": "x-office-calendar", "hint": "Enter", "query": q})
         elif q and (said := intents(q)):
             icon = {"timer": "alarm-symbolic", "timer-cancel": "alarm-symbolic", "open": "system-run-symbolic",
-                    "dismiss": "window-close-symbolic",
+                    "dismiss": "window-close-symbolic", "record": "media-record-symbolic",
+                    "record-stop": "media-playback-stop-symbolic",
                     "update-system": "system-software-update-symbolic"}.get(said[0][0], "audio-volume-medium-symbolic")
             if said[0][0] in ("next", "previous", "pause", "play", "whats-playing"):
                 icon = "multimedia-player-symbolic"

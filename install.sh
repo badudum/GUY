@@ -67,6 +67,7 @@ declare -A NEED=(
     [wl-copy]=wl-clipboard [playerctl]=playerctl [wpctl]=wireplumber [pw-play]=pipewire
     [fd]=fd [grim]=grim [notify-send]=libnotify [xdg-open]=xdg-utils [wtype]=wtype
     [curl]=curl [unzip]=unzip [secret-tool]=libsecret
+    [wf-recorder]=wf-recorder [slurp]=slurp
 )
 missing=()
 for thing in "${!NEED[@]}"; do
